@@ -133,7 +133,9 @@ public:
      * current strip while a streaming frame is running */
     AMOLED_Canvas &canvas(void) { return _canvas; }
 
-    /* send the whole framebuffer to the panel, strip by strip (asynchronous) */
+    /* send the whole framebuffer to the panel, strip by strip.  The strips
+     * overlap internally; when the call returns the framebuffer can be drawn
+     * into again safely. */
     void push(void);
 
     /* send just one rectangle of the framebuffer (panel coordinates).
@@ -159,11 +161,12 @@ public:
 private:
     AMOLED_Canvas _canvas;
     AMOLED_Touch  _touch;
-    bool          _ready      = false;
-    uint8_t       _panelId    = 0;
-    uint8_t       _brightness = 0xFF;
-    uint8_t      *_fb         = nullptr;
-    int           _stripY     = 0;
-    bool          _stripDrawn = false;
-    uint8_t      *_stripBuf   = nullptr;
+    bool          _ready         = false;
+    uint8_t       _panelId       = 0;
+    uint8_t       _brightness    = 0xFF;
+    uint8_t      *_fb            = nullptr;
+    int           _stripY        = 0;   /* next strip to hand out         */
+    int           _pendingY      = 0;   /* screen line of the drawn strip  */
+    bool          _pending       = false;
+    uint8_t      *_stripBuf      = nullptr;
 };

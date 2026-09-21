@@ -38,7 +38,7 @@
 /*  80000000UL - if the picture stays clean you nearly double the frame  */
 /*  rate (651 kB have to cross the bus for every RGB888 frame).          */
 /* ==================================================================== */
-#define AMOLED_QSPI_CLOCK_HZ        40000000UL
+#define AMOLED_QSPI_CLOCK_HZ        80000000UL
 
 /* ==================================================================== */
 /*  4. Colour depth                                                      */

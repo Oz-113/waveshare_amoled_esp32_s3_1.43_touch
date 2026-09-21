@@ -282,43 +282,45 @@ void AMOLED::fadeBrightness(uint8_t to, uint16_t ms)
 /* ==================================================================== */
 void AMOLED::beginFrame(void)
 {
-    _stripY     = 0;
-    _stripDrawn = false;
+    /* a strip that was handed out but never pushed would leak its buffer
+     * token, so make sure it is queued */
+    if (_pending) pushStrip();
+    _stripY = 0;
 }
 
 bool AMOLED::nextStrip(AMOLED_Canvas &canvas)
 {
     if (!_ready) return false;
 
-    /* queue whatever the caller drew on the previous call */
-    if (_stripDrawn)
-    {
-        amoledQueueStrip(_stripBuf, _stripY, amoledClampI(AMOLED_HEIGHT - _stripY, 1, AMOLED_STRIP_LINES));
-        _stripDrawn = false;
-        _stripY += AMOLED_STRIP_LINES;
-    }
+    /* if the caller did not push the strip he drew, push it now */
+    if (_pending) pushStrip();
 
     if (_stripY >= AMOLED_HEIGHT) return false;      /* frame complete */
 
     _stripBuf = amoledTakeStripBuffer();             /* waits for a free buffer */
     if (!_stripBuf) return false;
 
+    /* remember where this strip belongs and advance to the next one - the
+     * row counter must move here, not when the push happens, otherwise a
+     * frame would render the same strip over and over */
+    _pendingY = _stripY;
     const int lines = amoledClampI(AMOLED_HEIGHT - _stripY, 1, AMOLED_STRIP_LINES);
-    canvas.beginStrip(_stripBuf, _stripY, lines);
-    _stripDrawn = true;
+    canvas.beginStrip(_stripBuf, _pendingY, lines);
+    _stripY += AMOLED_STRIP_LINES;
+    _pending = true;
     return true;
 }
 
 void AMOLED::pushStrip(void)
 {
-    if (!_stripDrawn) return;
-    amoledQueueStrip(_stripBuf, _stripY, amoledClampI(AMOLED_HEIGHT - _stripY, 1, AMOLED_STRIP_LINES));
-    _stripDrawn = false;
+    if (!_pending) return;
+    amoledQueueStrip(_stripBuf, _pendingY, amoledClampI(AMOLED_HEIGHT - _pendingY, 1, AMOLED_STRIP_LINES));
+    _pending = false;
 }
 
 void AMOLED::endFrame(void)
 {
-    if (_stripDrawn) pushStrip();                    /* safety net */
+    if (_pending) pushStrip();                       /* safety net */
     _stripY = 0;
     if (_fb) _canvas.beginFull(_fb);                 /* canvas back on the framebuffer */
 }
@@ -376,6 +378,10 @@ void AMOLED::push(void)
                (size_t)lines * AMOLED_WIDTH * AMOLED_BPP);
         amoledQueueStrip(buf, y, lines);
     }
+
+    /* the strips overlap internally while they are queued, but once this
+     * returns the framebuffer may be drawn into again safely */
+    waitIdle();
 }
 
 void AMOLED::pushRect(int x0, int y0, int x1, int y1)

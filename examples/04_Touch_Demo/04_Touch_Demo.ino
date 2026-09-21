@@ -28,6 +28,8 @@ static bool     lastDown = false;
 #define PANEL_X1 (CX + 130)
 #define PANEL_Y1 (CY + 70)
 
+static inline int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
 static void drawPanel(void)
 {
     AMOLED_Canvas &fb = amoled.canvas();
@@ -58,9 +60,14 @@ static void drawPanel(void)
         fb.fillRect(bx, PANEL_Y0 + 78, bx + bw, PANEL_Y0 + 83, AMOLED_DARKGREY);
         fb.fillRect(bx, PANEL_Y0 + 78, bx + (y * bw) / H, PANEL_Y0 + 83, AMOLED_ORANGE);
 
-        /* a soft glow right under the finger plus a ring around it */
-        fb.addGlow(x, y, 26, AMOLED_WHITE, 90);
-        fb.addArc(x, y, 22, 0, 360, 2, AMOLED_WHITE, 110);
+        /* the ripple: clamped into the panel, so the next repaint of the
+         * panel erases it again.  (An additive glow drawn outside the panel
+         * would pile up in the framebuffer for ever - that is the one trap of
+         * the framebuffer mode.) */
+        const int gx = clampInt(x, PANEL_X0 + 34, PANEL_X1 - 34);
+        const int gy = clampInt(y, PANEL_Y0 + 34, PANEL_Y1 - 34);
+        fb.addGlow(gx, gy, 26, AMOLED_WHITE, 90);
+        fb.addArc(gx, gy, 22, 0, 360, 2, AMOLED_WHITE, 110);
     }
     else
     {
@@ -68,8 +75,8 @@ static void drawPanel(void)
         fb.drawTextCentered(CX, PANEL_Y0 + 90, "TAP = COUNT   HOLD = FLASH", AMOLED_DARKGREY, 1);
     }
 
-    /* the ripple can reach beyond the panel, so push the whole area */
-    amoled.pushRect(PANEL_X0 - 40, PANEL_Y0 - 40, PANEL_X1 + 40, PANEL_Y1 + 40);
+    /* only the panel is sent to the display - one DMA transfer per row */
+    amoled.pushRect(PANEL_X0, PANEL_Y0, PANEL_X1, PANEL_Y1);
 }
 
 void setup()

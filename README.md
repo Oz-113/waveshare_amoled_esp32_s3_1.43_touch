@@ -116,11 +116,26 @@ amoled.pushRect(20, 20, 120, 90);              // or just one region
 ```
 
 `push()` copies the framebuffer through the strip buffers (so it is safe on
-any board), `pushRect()` sends one DMA transfer per row and returns when the
-framebuffer may be modified again.
+any board; the strips overlap internally, ~33 ms for a full frame at 40 MHz),
+`pushRect()` sends one DMA transfer per row. Both return when the framebuffer
+may be drawn into again.
 
 > Do not mix `push()`/`pushRect()` with an active streaming frame - call
 > `amoled.endFrame()` first.
+
+### Two pitfalls worth knowing
+
+* **Every strip you drew must be pushed.** `pushStrip()` is what queues it;
+  if you forget it, the next `nextStrip()` pushes it for you, so nothing is
+  lost - but if you `break` out of the loop in the middle of a frame, that
+  strip never reaches the panel.
+* **Additive drawing in framebuffer mode accumulates.** `addGlow()`,
+  `addPixel()`, `addArc()` … only add light, and the framebuffer is not cleared
+  for you, so a glow drawn every frame gets brighter and brighter until the
+  whole screen is washed out. Two ways out: use streaming mode (each strip is
+  drawn from scratch every frame), or repaint the affected rectangle before you
+  draw into it (see `04_Touch_Demo`, where the status panel is repainted
+  opaquely and the glow is kept inside it).
 
 ---
 
