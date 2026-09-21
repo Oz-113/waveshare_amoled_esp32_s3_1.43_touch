@@ -1,0 +1,73 @@
+#############################################################
+# Syntax highlighting for the WaveshareAMOLED library
+#############################################################
+
+# classes and objects
+AMOLED	KEYWORD1
+AMOLED_Canvas	KEYWORD1
+AMOLED_Touch	KEYWORD1
+amoled	KEYWORD1
+
+# methods
+begin	KEYWORD2
+beginFrame	KEYWORD2
+nextStrip	KEYWORD2
+pushStrip	KEYWORD2
+endFrame	KEYWORD2
+drawFrame	KEYWORD2
+waitIdle	KEYWORD2
+beginFramebuffer	KEYWORD2
+push	KEYWORD2
+pushRect	KEYWORD2
+setBrightness	KEYWORD2
+getBrightness	KEYWORD2
+setRotation	KEYWORD2
+getRotation	KEYWORD2
+setDisplayOn	KEYWORD2
+canvas	KEYWORD2
+touch	KEYWORD2
+width	KEYWORD2
+height	KEYWORD2
+initTables	KEYWORD2
+clearScreen	KEYWORD2
+fillScreen	KEYWORD2
+drawPixel	KEYWORD2
+addPixel	KEYWORD2
+addPixelScaled	KEYWORD2
+blendPixel	KEYWORD2
+drawLine	KEYWORD2
+addLine	KEYWORD2
+drawHLine	KEYWORD2
+drawVLine	KEYWORD2
+drawRect	KEYWORD2
+fillRect	KEYWORD2
+addRect	KEYWORD2
+drawCircle	KEYWORD2
+fillCircle	KEYWORD2
+addCircle	KEYWORD2
+addGlow	KEYWORD2
+addArc	KEYWORD2
+shadeRect	KEYWORD2
+drawText	KEYWORD2
+drawTextAdd	KEYWORD2
+drawTextBlend	KEYWORD2
+textWidth	KEYWORD2
+palette	KEYWORD2
+read	KEYWORD2
+
+# constants
+AMOLED_BLACK	LITERAL1
+AMOLED_WHITE	LITERAL1
+AMOLED_RED	LITERAL1
+AMOLED_GREEN	LITERAL1
+AMOLED_BLUE	LITERAL1
+AMOLED_CYAN	LITERAL1
+AMOLED_MAGENTA	LITERAL1
+AMOLED_YELLOW	LITERAL1
+AMOLED_ORANGE	LITERAL1
+AMOLED_PURPLE	LITERAL1
+AMOLED_PINK	LITERAL1
+AMOLED_GOLD	LITERAL1
+AMOLED_GREY	LITERAL1
+AMOLED_DARKGREY	LITERAL1
+AMOLED_LIGHTGREY	LITERAL1
