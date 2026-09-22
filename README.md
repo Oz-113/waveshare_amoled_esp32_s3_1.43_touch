@@ -41,7 +41,7 @@ void loop() { }
 > numbers — what gets rendered when, and on which line the pixels are pushed to
 > the panel.
 
-All **seven** examples are verified to compile with arduino-cli + esp32 core
+All **eight** examples are verified to compile with arduino-cli + esp32 core
 3.3.11 for `esp32:esp32:esp32s3` (16 MB flash, OPI PSRAM, USB CDC on boot), in
 both 24 bpp (RGB888) and 16 bpp (RGB565). The frame rate numbers in this README
 and in `GUIDE.md` are calculated from the QSPI byte budgets; the sketches print
@@ -86,8 +86,9 @@ No other library has to be installed.
 | `03_Contrast_Test` | no | hand written pixel loops with `ptr()` / `strideX()` |
 | `04_Touch_Demo` | **yes** | touch + framebuffer + `pushRect()` (only the HUD is re-sent) |
 | `05_Starfield` | no | streaming mode, 240 points of light, hold the screen to hyperjump |
-| `06_Rotating_Cube` | **yes** | 3D: 12 glowing edges, translucent faces, dirty rectangle updates, fps counter |
+| `06_Rotating_Cube` | **yes** | 3D wireframe cube (set `CUBE_FACES 1` for the translucent faces), dirty rectangle updates, fps counter |
 | `07_Rotating_Square` | no | the smallest animation there is: a rotated, filled square with a serial fps counter |
+| `08_IMU_Cube` | **yes** | the same cube held upright by the on board QMI8658 accelerometer: it hangs from real gravity and spins about the world vertical (tap = freeze, hold = axis signs) |
 
 ### arduino-cli
 ```bash

@@ -1,9 +1,10 @@
 /*
  * 06_Rotating_Cube - WaveshareAMOLED library
  * ============================================================================
- *  A neon cube spinning around two axes: twelve glowing edges, six translucent
- *  faces that add light through each other, and a colour that walks the 24 bit
- *  rainbow.  The frame rate is measured and reported on the serial port.
+ *  A neon wireframe cube spinning around two axes: twelve glowing edges and a
+ *  colour that walks the 24 bit rainbow.  Set CUBE_FACES to 1 if you also want
+ *  the six translucent faces that add light through each other.  The frame rate
+ *  is measured and reported on the serial port.
  *
  *  Shows: framebuffer mode + a dirty rectangle redraw + pushRect() + setClip().
  *
@@ -47,7 +48,8 @@
                                    /* 0 = push only the cube's own box       */
 #define CUBE_FPS_CAP      60       /* updates per second, 0 = as fast as it  */
                                    /* gets (more tearing, bigger number)     */
-#define CUBE_FACES        1        /* 1 = translucent additive faces         */
+#define CUBE_FACES        0        /* 0 = wireframe (the good looking one),  */
+                                   /* 1 = translucent additive faces as well */
 #define CUBE_EDGE_GLOW    1        /* 1 = soft halo around every edge        */
 #define CUBE_SHOW_FPS     1        /* frame rate on the display              */
 #define CUBE_SERIAL_FPS   1        /* frame rate on the serial port          */

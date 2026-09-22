@@ -1,16 +1,18 @@
 # WaveshareAMOLED — the guide
 
-Everything about this library and about the rotating cube demo (examples
-`06_Rotating_Cube` and `F:\skeces\amoled_rotating_cube`): the maths, the
+Everything about this library and about the cube demos (examples
+`06_Rotating_Cube` / `08_IMU_Cube` and the standalone copies in
+`F:\skeces\amoled_rotating_cube` / `F:\skeces\amoled_imu_cube`): the maths, the
 drawing, what each component is, which library or API it comes from, and what
 happens on which line when a frame is rendered and pushed to the panel.
 
 * **Part A** — the rotating cube project: the maths and the components.
 * **Part B** — how this library works, from your sketch down to the QSPI wires.
-* **Part C** — where to find the API reference (`README.md`), the examples and
+* **Part C** — the IMU: how the on board QMI8658 is used to hold the cube upright.
+* **Part D** — where to find the API reference (`README.md`), the examples and
   what to build next.
 
-> Line numbers refer to **library version 1.0.2**. They are here to help you
+> Line numbers refer to **library version 1.0.3**. They are here to help you
 > read the code, not as a permanent contract — if you edit a file they move.
 
 
@@ -47,7 +49,7 @@ The whole animation is this seven step loop (`loop()`):
 | 1 | `rotatePoint()` × 14 — 8 corners + 6 face normals | 8 sin/cos calls, ~50 flops — nothing |
 | 2 | `project()` × 8 — perspective divide, bounding box | nothing |
 | 3 | `setClip()` + one `fillRect()` over the old + new box in true black | ~1 ms (only if the box is large) |
-| 4 | 3 faces (`fillQuad`), 12 edges (`drawEdge`), 8 glows (`addGlow`) | ~3 ms with faces, ~0.5 ms without |
+| 4 | the visible faces (`fillQuad` — only with `CUBE_FACES 1`), 12 edges (`drawEdge`), 8 glows (`addGlow`) | ~3 ms with faces, ~0.5 ms without |
 | 5 | `resetClip()` + `amoled.pushRect()` — only the box crosses the QSPI bus | **5–15 ms — this is the bottleneck** |
 | 6 | frame counter → fps, serial + on screen | nothing |
 
@@ -288,7 +290,7 @@ sliver cut-off (`CUBE_MIN_FACE_AREA`).
 | 3 | union with last frame's box (the cube moved!) |
 | 3 | `setClip(box)` then `fillRect(box, AMOLED_BLACK)` — erase; black on an AMOLED means the pixels are off |
 | 4 | `hueBase` for this frame |
-| 4 | the three visible faces: cull, shade, `fillQuad()` |
+| 4 | the three visible faces (`CUBE_FACES 1` only): cull, shade, `fillQuad()` |
 | 4 | the twelve edges: `drawEdge()` with a per-edge hue |
 | 4 | the eight corners: `addGlow()` (a radial light blob each) |
 | 4 | `resetClip()` — back to the whole framebuffer |
@@ -622,46 +624,184 @@ hand-written register pokes.
 
 ---
 
-# Part C — where to look next
+# Part C — holding the cube upright with the IMU (example 08_IMU_Cube)
+
+## C0. What it does
+
+`08_IMU_Cube` is `06_Rotating_Cube` with one addition: the on board **QMI8658
+accelerometer** tells the sketch where "down" is, so the cube
+
+* keeps its **top face pointing at the sky** however you turn the display,
+* keeps **spinning about the world vertical** (not about a screen axis),
+* and is lit by a sun that is fixed in the **world**, so turning the device
+  around shows a different side of it.
+
+So the cube behaves like an object standing still in the room while the screen
+turns around it. Touching it:
+
+| gesture | effect |
+|---|---|
+| tap | freeze / unfreeze the spin |
+| hold 0.7 s | next of the four sensor → display sign variants (see C4) |
+
+If no IMU answers (or `CUBE_IMU_ENABLE 0`), the sketch falls back to the
+automatic two axis spin of 06 and says so on the panel.
+
+## C1. The chip, and how it is read
+
+The QMI8658 sits on the **same I2C bus as the touch panel** (SDA 47 / SCL 48),
+which `amoled.begin()` → `AMOLED_Touch::begin()` already started
+(`Wire.begin(...)`, 400 kHz) — the sketch adds no bus setup at all.
+
+| register | value written | why |
+|---|---|---|
+| `0x00` WHO_AM_I | – | must read `0x05`; the chip answers at `0x6B` or `0x6A` (SA0), so both are tried |
+| `0x02` CTRL1 | `0x60` | bit 6 = address auto increment, so one burst read can return all six data bytes |
+| `0x03` CTRL2 | `0x25` | bits 6:4 = accel range `2` = 8 g, bits 3:0 = output rate `5` = 250 Hz |
+| `0x08` CTRL7 | `0x01` | bit 0 = accelerometer enable (written last, after `0x00`) |
+| `0x2E` STATUS0 | – | bit 0 = a fresh accelerometer sample is ready |
+| `0x35…0x3A` | – | ax, ay, az as little endian `int16`, **4096 LSB per g** at 8 g |
+
+The register map and the sequence are the same ones Waveshare's own
+`Arduino/examples/03_I2C_QMI8658` uses (that example is where this list came
+from — its `qmi8658c.cpp` `qmi8658_config_acc()` / `read_sensor_data()` are the
+reference). Their driver enables gyro and interrupts as well; the cube needs
+neither, so `imuBegin()` writes four registers and is done.
+
+Reading is two short I2C transfers per frame (`imuRead()`), which costs a few
+tens of microseconds and is invisible in the frame budget.
+
+## C2. The maths: from gravity to a rotation
+
+**1) The accelerometer measures "up", not "down".** At rest it reports the
+*reaction* to gravity — a phone lying flat, screen up, reports `+1 g` out of the
+screen. So the reading, in g, is the world vertical pointing at the sky.
+
+**2) Map it into the renderer's coordinates.** The display frame is x right,
+y down, z into the screen; the cube code uses x right, **y up**, z into the
+screen (screen y grows downwards). Hence
+
+```cpp
+V3 up = { gravityDisp.x, -gravityDisp.y, gravityDisp.z };   /* +y is up here */
+```
+
+**3) Build a frame from it.** `worldMatrix()` turns that one vector into a whole
+orthonormal basis whose *y* axis is the world vertical:
+
+```
+wy = normalize(up)
+wx = normalize(wy × screen-forward)      /* screen-forward = (0,0,1)   */
+wz = wx × wy                             /* right handed               */
+Q  = [wx wy wz]                          /* as columns                 */
+```
+
+Held upright, `up = (0,1,0)`, `wx = (1,0,0)`, `wz = (0,0,1)` and **Q is the
+identity** — the cube looks exactly like in 06. Tilt the display and Q rotates
+the other way, so the cube stays put in the world. (If the display lies flat,
+where any horizontal direction is as good as any other, the reference falls back
+to `(0,1,0)` so the basis cannot degenerate.)
+
+**4) Spin about the vertical.** The animation is a rotation about `wy`:
+
+```
+S = rotation about +y by the accumulated spin angle
+m = Q · S            /* world -> screen, applied to the 8 corners */
+```
+
+That is the whole trick: gravity only fixes the cube's orientation *up to a spin
+about the vertical*, and that is precisely the free parameter an animation
+wants. Both "hang correctly" and "keep turning" come out of the same matrix.
+
+**5) The light.** `kLight` is a direction in the *world*, so it goes through the
+alignment too: `lightView = Q · kLight`. Without the IMU `Q` is the identity and
+the sun stays fixed to the screen, exactly as in 06.
+
+**6) Noise.** `imuUpdate()` normalises every sample, ignores the ones whose
+magnitude is more than `IMU_SHAKE_G` away from 1 g (that means the device is
+being moved, and the reading is acceleration, not gravity), and low passes the
+direction with `IMU_FILTER` (0.15 per sample) before it is used.
+
+## C3. Where each piece lives in the sketch
+
+| Piece | In `08_IMU_Cube` | Notes |
+|---|---|---|
+| the I2C helpers | `imuRead()`, `imuWrite()` | plain `Wire` calls, no library needed |
+| chip bring-up | `imuBegin()` | WHO_AM_I probe at `0x6B`/`0x6A`, then four register writes |
+| one sample | `imuReadRaw()` | STATUS0 bit 0, then a 6 byte burst; converts to g |
+| mapping + filter | `imuUpdate()` | the only place that knows about `kImuSigns[]` |
+| the alignment | `worldMatrix()` | gravity → the frame `Q` |
+| the animation | `spinMatrix()`, `mul()` | `S` (yaw + pitch, or the world spin), then `m = Q · S` |
+| the cube | `apply(m, …)`, `project()` | 8 corners and 6 normals go through `m` |
+| drawing | `drawEdge()`, `fillQuad()` (faces off by default), `addGlow()` | the same code as 06 |
+| the readouts | `drawFpsText()`, `drawImuText()`, `pushTextBox()` | each one pushes only its own little box when it changes |
+| the loop | steps 0…8 | frame cap, touch, IMU, rotation, projection, dirty box, erase + `setClip`, draw, push, readouts |
+
+Library API used, and nothing else: `begin()`, `setBrightness()`,
+`beginFramebuffer()`, `canvas()`, `setClip()`/`resetClip()`, `fillRect()`,
+`drawPixel()`, `addPixelScaled()`, `addGlow()`, `addHLine()`, `drawText()`,
+`drawTextCentered()`, `textWidth()`, `pushRect()`, `push()`,
+`touch().update()/tapped()/heldOnce()`.
+
+## C4. The axis mapping — the one thing that may need your eyes
+
+The image has to be built in the *display's* axes, but the accelerometer lives in
+its *own* axes, and how the sensor sits inside the case is not something a driver
+can know — Waveshare's IMU example does not document it either (it leaves its
+`qmi8658_axis_convert(acc, gyro, 0)` at the identity layout). So the sketch
+
+* starts from a documented guess: `IMU_SIGN_VARIANT 1`, i.e. the sensor's x is
+  the display's x, and y and z are negated (the usual arrangement for a sensor
+  mounted behind a panel),
+* lets you **cycle the four sign variants with a long press** (hold ~0.7 s), and
+* always shows what it believes, on the panel and on the serial port:
+
+```
+G +0.02 +0.98 -0.01   SIGN 1  + - -   SPIN
+```
+
+Two checks settle it — with the right variant both of these are true (the
+readout is what an accelerometer reports at rest: the *upward* reaction to
+gravity, so it points at the sky):
+
+| hold the display… | …and the mapped gravity reads |
+|---|---|
+| flat on the table, screen up | `(0, 0, -1)` — the cube lies flat, its top face pointing into the screen, away from you |
+| upright in front of you | `(0, -1, 0)` — the cube is still level |
+
+Put the variant number that passes both into `IMU_SIGN_VARIANT` so it is the
+default after the next reset. The four variants are `+ + +`, `+ - -`, `- + -`,
+`- - +` (the sign combinations with a positive determinant, i.e. proper
+rotations). Should a board ever place the sensor rotated by 90° rather than
+mirrored, the fix is the single line in `imuUpdate()` where the three components
+are taken from `raw[]` — swap the indices there.
+
+---
+
+# Part D — where to look next
 
 * **`README.md`** (this folder) — the installed API: every class, every method,
   the config defines, the examples, the tearing notes, troubleshooting.
 * **`examples/`** — 01 Hello Colours (static test card), 02 Glow Orbs, 03
   Contrast Test (hand written pixel loops), 04 Touch Demo, 05 Starfield
-  (streaming), 06 Rotating Cube (3D + dirty rectangle), 07 Rotating Square
-  (smallest possible animation with a frame rate counter).
-* **`F:\skeces\amoled_rotating_cube`** — the same cube as a standalone sketch,
-  with its own README, so you can hack on it without touching the library.
+  (streaming), 06 Rotating Cube (3D wireframe + dirty rectangle), 07 Rotating
+  Square (smallest possible animation with a frame rate counter), 08 IMU Cube
+  (the cube held upright by gravity).
+* **`F:\skeces\amoled_rotating_cube`** and **`F:\skeces\amoled_imu_cube`** — the
+  two cube sketches as standalone projects with their own READMEs, so you can
+  hack on them without touching the library.
 * **`src/AMOLED_Config.h`** — the one file to edit: pins, colour depth, QSPI
   clock, rotation, strip size, touch, framebuffer.
-
-## C1. Next step: let the IMU hold the cube up
-
-The board carries a QMI8658 6 axis IMU on the same I2C bus as the touch
-controller, so it needs no extra wiring. The plan, in four steps:
-
-1. **Read the accelerometer.** `Wire` on the same pins as `AMOLED_Touch`
-   (SDA 47 / SCL 48), IMU address `0x6B`. Enable the accelerometer, then read six
-   bytes from the data register: accel X, Y, Z as little endian `int16`
-   (register map: `CTRL1` 0x02, `CTRL2` 0x03 for the accel range, `CTRL7` 0x08 to
-   enable, data from 0x35). *Verify the addresses against Waveshare's own IMU
-   example for this board before trusting them.*
-2. **Low pass it.** `g = g * 0.85 + gNew * 0.15` — the cube should tilt
-   smoothly, not shake with every hand movement.
-3. **Build the rotation that puts `g` onto `(0, +1, 0)`**, i.e. the "up" of the
-   cube's space. With `a` = the direction you want gravity to end up in
-   (`(0, +1, 0)`), `b = normalised g`, `v = a × b`, `c = a · b`, `s² = v · v`,
-   Rodrigues' formula gives the whole matrix in one line:
-   `R = I + [v]× + [v]×² · (1 − c) / s²`
-   (`[v]×` is the 3 × 3 skew-symmetric matrix of `v`).
-4. **Apply `R` after yaw/pitch** in `rotatePoint()`, so the cube spins in board
-   space but always keeps one corner pointing at the sky.
-
-Where it goes: a `#define CUBE_USE_IMU` block in `06_Rotating_Cube`, an
-`imuUpdate()` that runs once per frame, and `rotatePoint()` growing a second
-rotation. Everything else (the dirty rectangle, the push, the fps counter) stays
-exactly as it is — the IMU only changes the 8 corners and 6 normals that go in,
-which is the point of keeping the maths at the top of the sketch.
+* **Ideas that would be next**, roughly in order of payoff:
+  1. use the **gyro** as well — the gyro's angular rate plus the accelerometer
+     direction is a proper attitude filter (a complementary filter is a dozen
+     lines), which makes the cube follow quick rotations without lag;
+  2. **throw gestures**: integrate the gyro on a flick and let the cube spin on,
+     decaying over a second or two;
+  3. a **spirit level** or a bubble level screen — the same `gravityDisp` vector,
+     a completely different use;
+  4. the shape itself: the same maths drives any set of vertices, so a second
+     example could swap the cube for a tetrahedron or a pyramid with two tables
+     changed.
 
 
 
