@@ -1,3 +1,4 @@
+
 /*
  * 08_IMU_Cube - WaveshareAMOLED library
  * ============================================================================
@@ -231,8 +232,9 @@ static M3 identity(void)
     return m;
 }
 
-/* the spin of the animation.  With an IMU this is a rotation about the world
- * vertical; without one it is the classic yaw + pitch. */
+/* the spin of the animation.  With an IMU this is a rotation about +y, which the
+ * alignment above has just put along the world vertical; without one it is the
+ * classic yaw + pitch of 06_Rotating_Cube. */
 static M3 spinMatrix(float yaw, float pitch, bool imuOk)
 {
     const float cy = cosf(yaw), sy = sinf(yaw);
@@ -256,36 +258,60 @@ static M3 spinMatrix(float yaw, float pitch, bool imuOk)
     return m;
 }
 
-/* The frame the cube lives in: +y is the measured world vertical, and the
- * display's forward axis (+z) is used as the horizontal reference, so a
- * display held upright gives the identity - the cube looks exactly like in
- * 06_Rotating_Cube until you tilt it. */
-static M3 worldMatrix(const V3 &up)
+/* ------------------------------------------------------------------ */
+/*  Aligning the cube with gravity                                     */
+/*                                                                    */
+/*  We want the cube's own +y (the normal of its top face) to point    */
+/*  along the measured world vertical - and we want that alignment to  */
+/*  be *stable*: it must not add a twist of its own, or the cube turns */
+/*  with the display instead of staying put in the room.               */
+/*                                                                    */
+/*  So it has to be the *shortest* rotation that takes +y onto `up`,   */
+/*  which is Rodrigues' formula for the axis v = y x up:               */
+/*                                                                    */
+/*      R = I + [v]x + [v]x^2 * (1 - c) / s2                           */
+/*                                                                    */
+/*  with c = y . up and s2 = v . v.  Written out, the entries are      */
+/*                                                                    */
+/*      R00 = 1 + k (vx^2 - s2)      R01 = -vz + k vx vy               */
+/*      R10 =      vz + k vx vy      R11 = 1 + k (vy^2 - s2)  ... etc. */
+/*                                                                    */
+/*  The degree of freedom that is left over - a spin about the         */
+/*  vertical - is exactly the animation, so it is applied separately   */
+/*  (see spinMatrix), as a rotation about the cube's own +y.           */
+/*                                                                    */
+/*  A display held upright measures up = (0, 1, 0) and gives the       */
+/*  identity, so the cube looks exactly like in 06_Rotating_Cube; roll */
+/*  the display by an angle and this returns exactly the opposite      */
+/*  rotation, which is what keeps the cube standing still in the room. */
+/* ------------------------------------------------------------------ */
+static M3 alignMatrix(const V3 &up)
 {
-    V3 wy = up;
-    normalize(wy);
+    V3 u = up;
+    normalize(u);
 
-    V3 ref = {0, 0, 1};                       /* the display's forward axis */
-    if (fabsf(wy.z) > 0.9f)                    /* flat on the table: any */
-    {                                          /* horizontal will do     */
-        ref.x = 0; ref.y = 1; ref.z = 0;
+    const V3    y  = {0, 1, 0};
+    const V3    v  = cross(y, u);
+    const float c  = dot(y, u);          /* cos(angle between +y and up) */
+    const float s2 = dot(v, v);
+
+    if (s2 < 1e-8f)                      /* parallel: nothing to rotate  */
+    {
+        if (c >= 0.0f) return identity();       /* already aligned      */
+        M3 flip;                                /* exactly upside down: */
+        flip.rx = {1, 0, 0};                    /* half a turn about x  */
+        flip.ry = {0, -1, 0};
+        flip.rz = {0, 0, -1};
+        return flip;
     }
 
-    V3 wx = cross(wy, ref);
-    if (dot(wx, wx) < 1e-6f)                   /* parallel after all: try the */
-    {                                          /* other reference             */
-        ref.x = 0; ref.y = 1; ref.z = 0;
-        wx = cross(wy, ref);
-    }
-    normalize(wx);
-    const V3 wz = cross(wx, wy);
+    const float k = (1.0f - c) / s2;
 
-    /* Q = [wx wy wz] as columns: it maps world coordinates to screen ones */
-    M3 q;
-    q.rx = {wx.x, wy.x, wz.x};
-    q.ry = {wx.y, wy.y, wz.y};
-    q.rz = {wx.z, wy.z, wz.z};
-    return q;
+    M3 m;
+    m.rx = { 1.0f + k * (v.x * v.x - s2),  -v.z + k * v.x * v.y,   v.y + k * v.x * v.z};
+    m.ry = {        v.z + k * v.x * v.y,  1.0f + k * (v.y * v.y - s2), -v.x + k * v.y * v.z};
+    m.rz = {       -v.y + k * v.x * v.z,   v.x + k * v.y * v.z,  1.0f + k * (v.z * v.z - s2)};
+    return m;
 }
 
 /* ================================================================== */
@@ -800,7 +826,7 @@ void loop()
 #endif
 
     /* ---- 2. the rotation: align with gravity, then spin ----------- */
-    M3   q       = identity();                    /* world -> screen      */
+    M3   align   = identity();                    /* gravity alignment    */
     bool aligned = false;                         /* is gravity driving it? */
 
 #if CUBE_IMU_ENABLE
@@ -808,8 +834,8 @@ void loop()
     {
         /* the renderer's +y is up on the screen, the display's +y is down */
         V3 up = { gravityDisp.x, -gravityDisp.y, gravityDisp.z };
-        q = worldMatrix(up);
-        aligned = true;
+        align    = alignMatrix(up);
+        aligned  = true;
     }
 #endif
 
@@ -817,13 +843,22 @@ void loop()
     if (spinOn) spinAngle += CUBE_SPIN_Y * dt;    /* frozen: hold the angle */
 
     const M3 s = spinMatrix(spinAngle, t * CUBE_SPIN_X, aligned);
-    const M3 m = mul(q, s);
+    const M3 m = mul(align, s);
 
-    /* The sun is a direction in the world, so it goes through the alignment as
-     * well.  Without an IMU q is the identity and it stays fixed to the screen,
-     * exactly like in 06_Rotating_Cube. */
+    /* The sun: a direction that stays put in the room.  Gravity only fixes the
+     * vertical, not the horizontal, so "the room" is the pose the device was in
+     * when the first sample arrived - captured once, as worldRef.  Without an
+     * IMU the light stays fixed to the screen, exactly as in 06_Rotating_Cube.
+     * (It only affects the optional faces.) */
+    static M3   worldRef;
+    static bool worldRefSet = false;
+    if (aligned && !worldRefSet)
+    {
+        worldRef    = align;
+        worldRefSet = true;
+    }
     const V3 lightWorld = { kLight[0], kLight[1], kLight[2] };
-    lightView = apply(q, lightWorld);
+    lightView = worldRefSet ? apply(worldRef, lightWorld) : lightWorld;
 
     /* ---- 3. rotate the cube -------------------------------------- */
     for (int i = 0; i < 8; i++)

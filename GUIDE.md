@@ -685,36 +685,70 @@ screen (screen y grows downwards). Hence
 V3 up = { gravityDisp.x, -gravityDisp.y, gravityDisp.z };   /* +y is up here */
 ```
 
-**3) Build a frame from it.** `worldMatrix()` turns that one vector into a whole
-orthonormal basis whose *y* axis is the world vertical:
+**3) Align with it, by the shortest path.** `alignMatrix()` returns the rotation
+that takes the cube's own +y (the normal of its top face) onto `up` using the
+**shortest arc** — Rodrigues' formula for the axis `v = y × up`:
 
 ```
-wy = normalize(up)
-wx = normalize(wy × screen-forward)      /* screen-forward = (0,0,1)   */
-wz = wx × wy                             /* right handed               */
-Q  = [wx wy wz]                          /* as columns                 */
+c  = y · up                  /* cos of the angle between them */
+v  = y × up
+s2 = v · v
+R  = I + [v]× + [v]×² · (1 − c) / s2
 ```
 
-Held upright, `up = (0,1,0)`, `wx = (1,0,0)`, `wz = (0,0,1)` and **Q is the
-identity** — the cube looks exactly like in 06. Tilt the display and Q rotates
-the other way, so the cube stays put in the world. (If the display lies flat,
-where any horizontal direction is as good as any other, the reference falls back
-to `(0,1,0)` so the basis cannot degenerate.)
+Written out, the entries are (this is exactly the code):
 
-**4) Spin about the vertical.** The animation is a rotation about `wy`:
+```
+R00 = 1 + k(vx² − s2)   R01 = −vz + k·vx·vy   R02 =  vy + k·vx·vz
+R10 =      vz + k·vx·vy R11 = 1 + k(vy² − s2) R12 = −vx + k·vy·vz
+R20 =     −vy + k·vx·vz R21 =  vx + k·vy·vz   R22 = 1 + k(vz² − s2)
+```
+
+with `k = (1 − c)/s2`. Held upright, `up = (0,1,0)` gives `v = 0`, `s2 = 0` and
+the identity, so the cube looks exactly like in 06. Roll the display by φ and
+this reduces to exactly `Rz(−φ)` — **the opposite rotation**, which is what keeps
+the cube standing still in the room rather than turning with the device.
+
+> **Why "shortest" matters — the bug this fixes.** The first version built a
+> whole world frame from `up` plus the *current* screen-forward axis as a
+> horizontal reference. That looks tidy, but it makes the "world" frame ride
+> along with the display: rolling the device moved the reference with it, so the
+> cube turned *with* your hand instead of against it. Gravity alone cannot give
+> you a horizontal reference at all — so you must not invent one. Using only the
+> vertical, via the shortest rotation, leaves the one genuinely undetermined
+> degree of freedom (a spin about the vertical) where it belongs: to the
+> animation.
+
+Two limitations that come with using gravity only (both are inherent, not bugs):
+
+* **A turn about the vertical is invisible.** Rotating the display like a
+  turntable (keeping its tilt) does not change the gravity vector at all, so the
+  cube cannot know it happened and stays as it was on screen. An accelerometer
+  simply cannot see that axis — a **gyro** can, which is why "use the gyro too"
+  is first on the next-steps list in Part D.
+* **Held exactly upside down** the shortest rotation has no unique axis (any
+  half-turn about a horizontal axis does the same job), so the cube's roll can
+  snap as you pass through that pose. Same cure: the gyro.
+
+**4) Spin about the vertical.** The animation is a rotation about the cube's own
++y — which the alignment has just put along the world vertical:
 
 ```
 S = rotation about +y by the accumulated spin angle
-m = Q · S            /* world -> screen, applied to the 8 corners */
+m = a · S            /* a = the alignment, applied to the 8 corners */
 ```
 
 That is the whole trick: gravity only fixes the cube's orientation *up to a spin
 about the vertical*, and that is precisely the free parameter an animation
 wants. Both "hang correctly" and "keep turning" come out of the same matrix.
 
-**5) The light.** `kLight` is a direction in the *world*, so it goes through the
-alignment too: `lightView = Q · kLight`. Without the IMU `Q` is the identity and
-the sun stays fixed to the screen, exactly as in 06.
+**5) The light.** A direction that stays put in the *room* — but gravity fixes
+only the vertical and not the horizontal, so the "room" is defined once, from the
+pose the device was in when the first sample arrived (`worldRef`, captured in the
+loop). After that `lightView = worldRef · kLight` is constant, so the cube spins
+under a fixed sun. Without an IMU there is no `worldRef` and the light stays
+fixed to the screen, exactly as in 06. (It only affects the optional faces.)
+
 
 **6) Noise.** `imuUpdate()` normalises every sample, ignores the ones whose
 magnitude is more than `IMU_SHAKE_G` away from 1 g (that means the device is
@@ -729,8 +763,8 @@ direction with `IMU_FILTER` (0.15 per sample) before it is used.
 | chip bring-up | `imuBegin()` | WHO_AM_I probe at `0x6B`/`0x6A`, then four register writes |
 | one sample | `imuReadRaw()` | STATUS0 bit 0, then a 6 byte burst; converts to g |
 | mapping + filter | `imuUpdate()` | the only place that knows about `kImuSigns[]` |
-| the alignment | `worldMatrix()` | gravity → the frame `Q` |
-| the animation | `spinMatrix()`, `mul()` | `S` (yaw + pitch, or the world spin), then `m = Q · S` |
+| the alignment | `alignMatrix()` | gravity → the shortest rotation that stands the cube up (and therefore the *opposite* of how the display moved) |
+| the animation | `spinMatrix()`, `mul()` | `S` (yaw + pitch, or the world spin), then `m = align · S` |
 | the cube | `apply(m, …)`, `project()` | 8 corners and 6 normals go through `m` |
 | drawing | `drawEdge()`, `fillQuad()` (faces off by default), `addGlow()` | the same code as 06 |
 | the readouts | `drawFpsText()`, `drawImuText()`, `pushTextBox()` | each one pushes only its own little box when it changes |
