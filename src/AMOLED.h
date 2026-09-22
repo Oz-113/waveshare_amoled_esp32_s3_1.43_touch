@@ -138,8 +138,11 @@ public:
      * into again safely. */
     void push(void);
 
-    /* send just one rectangle of the framebuffer (panel coordinates).
-     * One DMA transfer per row - fast enough for normal UI updates. */
+    /* Send just one rectangle of the framebuffer (panel coordinates).
+     * The region is packed in bands of AMOLED_STRIP_LINES rows and each band
+     * goes out as one transfer, and every transfer is a whole number of 32
+     * bit words, so it is safe for a QSPI/DMA panel.  When the call returns
+     * the framebuffer can be drawn into again. */
     void pushRect(int x0, int y0, int x1, int y1);
 
     /* raw access to the framebuffer memory (panel order: row * width * bpp) */

@@ -1,16 +1,18 @@
 # WaveshareAMOLED — the guide
 
-Everything about this library and about the `amoled_rotating_cube` example:
-the maths, the drawing, what each component is, which library or API it comes
-from, and what happens on which line when a frame is rendered and pushed to the
-panel.
+Everything about this library and about the rotating cube demo (examples
+`06_Rotating_Cube` and `F:\skeces\amoled_rotating_cube`): the maths, the
+drawing, what each component is, which library or API it comes from, and what
+happens on which line when a frame is rendered and pushed to the panel.
 
 * **Part A** — the rotating cube project: the maths and the components.
 * **Part B** — how this library works, from your sketch down to the QSPI wires.
-* **Part C** — where to find the API reference (`README.md`) and what to tune.
+* **Part C** — where to find the API reference (`README.md`), the examples and
+  what to build next.
 
-> Line numbers refer to **library version 1.0.1**. They are here to help you
+> Line numbers refer to **library version 1.0.2**. They are here to help you
 > read the code, not as a permanent contract — if you edit a file they move.
+
 
 ---
 
@@ -20,34 +22,36 @@ panel.
 
 | Thing | Where it lives | What it is |
 |---|---|---|
-| `AMOLED amoled;` | the sketch, line 57 | one object that owns the panel: `begin()`, `pushRect()`, `canvas()`, `touch()` |
+| `AMOLED amoled;` | the sketch, near the top | one object that owns the panel: `begin()`, `pushRect()`, `canvas()`, `touch()` |
 | `AMOLED_Canvas` | `AMOLED_Canvas.h` / `.cpp` | the drawing surface: pixels, lines, circles, text, glow, arc. It clips everything and handles the rotation |
 | `AMOLED_Touch` | `AMOLED_Touch.h` | the FT3168 touch panel (not used by the cube) |
-| `fillQuad()`, `drawThickLine()`, `project()` … | the sketch itself | the 3D maths — that is *your* code, not the library's |
+| `fillQuad()`, `drawEdge()`, `project()` … | the sketch itself | the 3D maths — that is *your* code, not the library's |
 
-The cube needs three things from the library and nothing else:
+The cube needs four things from the library and nothing else:
 
 ```cpp
 amoled.begin();              // panel + touch + lookup tables
 amoled.beginFramebuffer();   // 651 kB of PSRAM to draw into, once
 amoled.canvas()              // the drawing surface (framebuffer)
+fb.setClip(x0,y0,x1,y1)      // "nothing may be drawn outside this box"
 amoled.pushRect(x0,y0,x1,y1) // send the changed rectangle to the panel
 ```
 
 ## A1. What has to happen for every frame
 
-The whole animation is this six step loop (`loop()`, line 313):
+The whole animation is this seven step loop (`loop()`):
 
 | Step | Code | Cost |
 |---|---|---|
+| 0 | hold the loop at `CUBE_FPS_CAP` (60) updates per second | nothing (a `delay(1)` wait) |
 | 1 | `rotatePoint()` × 14 — 8 corners + 6 face normals | 8 sin/cos calls, ~50 flops — nothing |
 | 2 | `project()` × 8 — perspective divide, bounding box | nothing |
-| 3 | one `fillRect()` over the old + new box in true black | ~1 ms (only if the box is large) |
-| 4 | 3 faces (`fillQuad`), 12 edges (`drawThickLine`), 8 glows (`addGlow`) | ~3 ms with faces, ~0.5 ms without |
-| 5 | `amoled.pushRect()` — only the box crosses the QSPI bus | **10–17 ms — this is the bottleneck** |
+| 3 | `setClip()` + one `fillRect()` over the old + new box in true black | ~1 ms (only if the box is large) |
+| 4 | 3 faces (`fillQuad`), 12 edges (`drawEdge`), 8 glows (`addGlow`) | ~3 ms with faces, ~0.5 ms without |
+| 5 | `resetClip()` + `amoled.pushRect()` — only the box crosses the QSPI bus | **5–15 ms — this is the bottleneck** |
 | 6 | frame counter → fps, serial + on screen | nothing |
 
-Everything else in the sketch serves those six steps.
+Everything else in the sketch serves those seven steps.
 
 ## A2. The maths
 
@@ -184,28 +188,56 @@ makes an AMOLED look like it emits light — overlapping faces get brighter whil
 the black background stays black (alpha blending would need an opaque backdrop).
 If `CUBE_FACES` is 0 the whole function is compiled out.
 
+Two safeguards were added after the first hardware test, both for faces that are
+almost edge on (a "sliver" of a few pixels):
+
+* the interpolated `x` is clamped to the quad's **own bounding box**, so even a
+  degenerate crossing can only ever land inside the quad;
+* a quad whose area (shoelace formula, `area2 = 2·area`) is under
+  `2 × CUBE_MIN_FACE_AREA` is skipped entirely. A face that thin cannot be seen,
+  but the pixels a wild crossing would put on the screen would be very visible —
+  and a stray pixel outside the dirty rectangle would never be erased again.
+
 ### The dirty rectangle — the frame rate trick
 
 The cube only covers a small part of the 466 × 466 screen, so sending the whole
 frame would waste the bus:
 
 ```
-full frame         466 * 466 * 3 B = 651 468 B  ->  33 ms at 40 MHz QSPI
-cube box ~300x320  300 * 320 * 3 B = 288 000 B  ->  14 ms
+full frame            466 * 466 * 3 B = 651 468 B  ->  32.6 ms at 40 MHz QSPI
+tight box   ~330x330  330 * 330 * 3 B = 326 700 B  ->  16.3 ms
+full width bands      466 * 352 * 3 B = 492 096 B  ->  24.6 ms
 ```
 
 So the sketch remembers where the cube was last frame, erases the **union** of
-the old and the new box with one `fillRect()` (sketch ~line 344/354), draws the
-cube, and then sends only that box:
+the old and the new box with one `fillRect()`, draws the cube, and then sends:
 
 ```cpp
-amoled.pushRect(ux0, uy0, ux1, uy1);     // library AMOLED.cpp:387
+fb.setClip(ux0, uy0, ux1, uy1);          // nothing may escape the box
+fb.fillRect(ux0, uy0, ux1, uy1, AMOLED_BLACK);
+... draw the cube ...
+fb.resetClip();
+amoled.pushRect(0, py0, W - 1, py1);     // library AMOLED.cpp:387
 ```
 
-`pushRect()` splits the box into bands of `AMOLED_STRIP_LINES` (32) rows, packs
-each band into a strip buffer (`AMOLED.cpp:420`) and sends it as **one** QSPI
-transfer with a window of exactly `(x0..x1, band)` (`AMOLED.cpp:424`) — so a
-300 × 320 box needs 10 transfers instead of 320.
+`pushRect()` splits the region into bands of `AMOLED_STRIP_LINES` (32) rows,
+packs each band into a strip buffer and sends it as **one** QSPI transfer with a
+window of exactly `(x0..x1, band)` — so a 330-row box needs 11 transfers instead
+of 330. Two details in the current implementation are worth knowing:
+
+* **every transfer is a whole number of 32 bit words.** The row count of a band
+  is rounded down to a multiple of four (`rows -= rows % 4`), and if fewer than
+  four rows are left the window is slid up so it still ends on `y1`. Rows are
+  then sent twice, which costs a little time but cannot change a pixel: the
+  extra rows hold exactly the same framebuffer content. A partial 32 bit word is
+  precisely the kind of thing that makes a QSPI/DMA path append stray bytes to
+  the panel's window;
+* **a full width region packs with a single `memcpy` per band** (`AMOLED.cpp`),
+  because the band is then one contiguous run of the framebuffer. That is why
+  `CUBE_FULL_WIDTH` is 1 by default: the transfers have the same shape as in
+  streaming mode and the packing is about ten times cheaper than 32 narrow
+  `memcpy`s. `CUBE_FULL_WIDTH 0` sends ~25 % fewer bytes (the tight box) if you
+  want the last drop of frame rate.
 
 ## A3. Where every piece comes from
 
@@ -226,10 +258,12 @@ contains the ESP-IDF parts.
 
 ## A4. The sketch, line by line
 
-**Knobs (lines 34–46)** — everything you may want to change: the three modes
-(`CUBE_DIRTY_RECT`, `CUBE_FACES`, `CUBE_SHOW_FPS`/`CUBE_SERIAL_FPS`), the two
-rotation speeds, the hue speed, the camera (`CUBE_CAM_DIST`, `CUBE_FOCAL`) and
-the fog strength.
+**Knobs (top of the sketch)** — everything you may want to change: how the box
+is pushed (`CUBE_DIRTY_RECT`, `CUBE_FULL_WIDTH`), the update rate
+(`CUBE_FPS_CAP`), what is drawn (`CUBE_FACES`, `CUBE_EDGE_GLOW`,
+`CUBE_SHOW_FPS`/`CUBE_SERIAL_FPS`), the two rotation speeds, the hue speed, the
+camera (`CUBE_CAM_DIST`, `CUBE_FOCAL`), the fog strength, the halo gain and the
+sliver cut-off (`CUBE_MIN_FACE_AREA`).
 
 **setup() (line ~259)**
 
@@ -243,22 +277,24 @@ the fog strength.
 | ~292 | `amoled.push()` — send that first picture once |
 | ~297 | the banner on the serial port |
 
-**loop() (line ~314)**
+**loop()**
 
-| Step | Line area | What happens |
-|---|---|---|
-| 1 | ~319 | yaw/pitch from `millis()`, then 8 corners + 6 normals through `rotatePoint()` |
-| 2 | ~325 | `project()` every corner and grow the bounding box from the results |
-| 3 | ~337 | add the glow margin (16 px) and clamp the box to the screen |
-| 3 | ~344 | union with last frame's box (the cube moved!) |
-| 3 | ~354 | `fillRect(..., AMOLED_BLACK)` — erase; black on an AMOLED means the pixels are off |
-| 4 | ~357 | `hueBase` for this frame |
-| 4 | ~360 | the three visible faces: cull, shade, `fillQuad()` |
-| 4 | ~381 | the twelve edges: `drawThickLine()` with a per-edge hue |
-| 4 | ~391 | the eight corners: `addGlow()` (a radial light blob each) |
-| 5 | ~398 | `amoled.pushRect(box)` and count the bytes |
-| 5 | ~407 | remember the box for the next frame |
-| 6 | ~412 | count frames; once per second: fps, frame time, kB per frame → screen + serial |
+| Step | What happens |
+|---|---|
+| 0 | `while (millis() - frameStartMs < 1000/CUBE_FPS_CAP) delay(1)` — the anti-tearing wait, skipped when `CUBE_FPS_CAP` is 0 |
+| 1 | yaw/pitch from `millis()`, then 8 corners + 6 normals through `rotatePoint()` |
+| 2 | `project()` every corner and grow the bounding box from the results |
+| 3 | add the glow margin (18 px) and clamp the box to the screen |
+| 3 | union with last frame's box (the cube moved!) |
+| 3 | `setClip(box)` then `fillRect(box, AMOLED_BLACK)` — erase; black on an AMOLED means the pixels are off |
+| 4 | `hueBase` for this frame |
+| 4 | the three visible faces: cull, shade, `fillQuad()` |
+| 4 | the twelve edges: `drawEdge()` with a per-edge hue |
+| 4 | the eight corners: `addGlow()` (a radial light blob each) |
+| 4 | `resetClip()` — back to the whole framebuffer |
+| 5 | `amoled.pushRect(...)` and count the bytes |
+| 5 | remember the box for the next frame |
+| 6 | count frames; once per second: fps, frame time, kB per frame → screen + serial |
 
 ## A5. The frame rate budget
 
@@ -266,8 +302,9 @@ the fog strength.
 data per frame / QSPI bandwidth = transfer time
 
   651 468 B / 20 MB/s  (40 MHz QSPI, 4 lanes) = 32.6 ms  -> 30 fps ceiling
-  300 000 B / 20 MB/s                         = 15.0 ms  -> 66 fps ceiling
-  300 000 B / 40 MB/s  (80 MHz QSPI)          =  7.5 ms  -> 130 fps ceiling
+  326 700 B / 20 MB/s  (tight dirty box)      = 16.3 ms  -> 61 fps ceiling
+  492 096 B / 40 MB/s  (full width, 80 MHz)   = 12.3 ms  -> 81 fps ceiling
+  326 700 B / 40 MB/s  (tight box, 80 MHz)    =  8.2 ms  -> 122 fps ceiling
 ```
 
 Add the render cost (≈ 1 ms erase + 3 ms faces + 0.5 ms edges and glows) and you
@@ -279,15 +316,72 @@ get the numbers below. Two consequences:
 * every millisecond of data you save is a millisecond of frame time, which is
   exactly why `pushRect()` exists.
 
-| Configuration (40 MHz QSPI) | Frame time (calculated) | fps |
-|---|---|---|
-| dirty box, faces on | ~18 ms | ~55 |
-| dirty box, `CUBE_FACES 0` | ~15 ms | ~65 |
-| whole frame, `CUBE_DIRTY_RECT 0` | ~34 ms | ~29 |
-| dirty box + 80 MHz QSPI | ~10 ms | ~95 |
+| Configuration | Data per frame | Frame time (calculated) | fps |
+|---|---|---|---|
+| full width bands, faces on, 80 MHz | 492 kB | ~13 ms | ~75 (capped at 60 by default) |
+| tight box, faces on, 80 MHz | 327 kB | ~10 ms | ~100 (capped at 60) |
+| tight box, `CUBE_FACES 0`, 80 MHz | 327 kB | ~7 ms | ~140 (capped at 60) |
+| full frame, `CUBE_DIRTY_RECT 0`, 80 MHz | 651 kB | ~21 ms | ~47 |
 
 The sketch prints the real numbers once per second, so you can check these
-estimates against your own board.
+estimates against your own board. **The numbers in the README/GUIDE are
+calculated from the bus arithmetic above, not measured** — the sketch's own
+serial output is the truth.
+
+## A6. Tearing — what the panel is doing while you push
+
+This is the honest part of the project, and it answers "why do the edges look
+cut/ doubled/ copied into a few bands?".
+
+The panel has a **scan out**: the controller reads its GRAM row by row, top to
+bottom, non stop (60 Hz means a full pass every 16.6 ms). There is no
+tear-effect (TE) pin wired on this board, so **there is no way to tell the
+controller "wait, I am still sending"**. Whatever you push lands in GRAM while
+the current pass is already half way down the screen. The result is one visible
+**seam** per frame: above it the picture is already the new one, below it the
+picture is still the previous frame.
+
+Two things make that seam much more obvious on this sketch than on a normal
+demo:
+
+* the cube is **thin, bright and on pure black**. A gradient scene hides the
+  seam completely (the 5 original demo scenes never showed it), a 1 px neon edge
+  on #000000 makes it a visible step in the line;
+* if the loop runs **faster than the panel refreshes**, more than one frame is
+  in flight and more than one seam is on screen. At 200 fps that is three or
+  four generations of the cube stacked in horizontal bands, each one a step
+  further round — which is exactly the "the line breaks into a few parallel
+  parts" symptom. It looks like four equal bands because each generation is
+  whatever the last 16.6 ms of pushes produced.
+
+What actually helps, best first:
+
+1. **`CUBE_FPS_CAP 60`** (the default). One update per panel pass means at most
+   one seam can exist, and the eye reads a single moving seam as ordinary motion
+   blur rather than as a broken shape. Set it to 0 to see the raw frame rate the
+   ESP32 can do, and to see why you would not want to.
+2. **A faster bus** (`AMOLED_QSPI_CLOCK_HZ 80000000UL`, the default in this
+   library): the seam is written in half the time, so it moves through the
+   picture twice as fast and is twice as easy to miss.
+3. **Fewer bytes per frame** — `CUBE_FULL_WIDTH 0`, `CUBE_FACES 0`, RGB565.
+4. **A motion trail** (`SQUARE_TRAIL` in 07, or a dim redraw instead of
+   `fillRect(BLACK)`) turns the seam into an intentional looking blur.
+
+### Telling tearing and drawing bugs apart
+
+Set `CUBE_SPIN_X` and `CUBE_SPIN_Y` to `0.0f` so the cube stands still:
+
+* if the artifacts **vanish** they were tearing (a timing effect, not a bug in
+  the picture);
+* if they **stay on a frozen cube**, the drawing is wrong — and that is a real
+  bug worth chasing.
+
+That is also the test that separated the two problems in this project: the
+earlier "thick line" drew three parallel strokes of the same edge (which reads
+as a doubled/ tripled line), and the near-edge-on faces could interpolate a
+crossing outside the quad. Both are fixed now (`drawEdge()` draws one core plus
+a *perpendicular* halo, `fillQuad()` clamps and skips slivers), and what is left
+on a hard edge at high frame rates is the panel's seam.
 
 ---
 
@@ -403,7 +497,7 @@ For partial regions there is `pushRect()` — see B4.
 |---|---|---|
 | `beginFramebuffer()` | 350 | `heap_caps_malloc(466*466*3, MALLOC_CAP_SPIRAM)` (line 358) = 651 468 bytes, then `_canvas.beginFull(_fb)` (line 364). `beginFull()` is literally `beginStrip(fb, 0, AMOLED_HEIGHT)`: the "strip" *is* the whole image. |
 | `push()` | 368 | loops over the strips: take a strip buffer → `memcpy` the strip out of PSRAM (line 377) → queue it. The copies overlap the DMA of the previous strip. Ends with `waitIdle()` (line 384) so the framebuffer is safe to draw into again. |
-| `pushRect(x0,y0,x1,y1)` | 387 | clamps the rectangle, then works in bands of `AMOLED_STRIP_LINES`: `memcpy` the band's rows into a strip buffer (line 420) and `esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1+1, y+rows, buf)` (line 424) — a transfer with a **partial window**. 10 transfers for a 300-row box instead of 300, which is exactly why the cube uses it. `waitIdle()` at the end (line 432). |
+| `pushRect(x0,y0,x1,y1)` | 387 | clamps the rectangle, then works in bands of `AMOLED_STRIP_LINES`: the band's rows are packed into a strip buffer and `esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1+1, y+rows, buf)` sends them as one transfer with a **partial window**. 11 transfers for a 330-row box instead of 330, which is exactly why the cube uses it. Two refinements: the row count of a band is rounded to a multiple of four (`rows -= rows % 4`, so every transfer is a whole number of 32 bit words, with the window slid up if fewer than four rows are left), and a **full width** region is packed with a single contiguous `memcpy` instead of one per row. `waitIdle()` at the end. |
 
 Both end with `waitIdle()`, so after `push()`/`pushRect()` returns you can draw
 into the framebuffer again without tearing.
@@ -433,10 +527,18 @@ of screen rows.
 
 Consequences worth knowing:
 
-* `width()`/`height()` return the *logical* size of the region this canvas can
-  draw, and `clipX0()…clipY1()` is what every primitive clamps to. A scene
-  function can therefore be written as if it painted the whole screen — the
-  canvas throws away whatever is outside the strip.
+* `width()`/`height()` return the *logical* size of the **window** this canvas
+  can draw (the strip, or the whole framebuffer), and `clipX0()…clipY1()` is
+  what every primitive clamps to. A scene function can therefore be written as
+  if it painted the whole screen — the canvas throws away whatever is outside
+  the strip.
+* `setClip(x0,y0,x1,y1)` narrows the clip to a rectangle inside the window and
+  `resetClip()` puts it back. `setClip()` re-derives `_idx0` from the new clip
+  origin (`AMOLED_Canvas.cpp`, `_widx0 + (x0-_wx0)*_stepX + (y0-_wy0)*_stepY`),
+  so the same one-add addressing keeps working. `width()`/`height()` deliberately
+  keep describing the window, so layout code does not change when a clip is set.
+  This is the "nothing may be drawn outside the rectangle I am going to push"
+  guarantee that a dirty rectangle renderer needs.
 * `strideX()`/`strideY()` return the byte step for +1 logical x/y (negative
   under rotation). Fast hand-written loops use
   `p = cv.ptr(x, y); … p += cv.strideX();` (the demo and `03_Contrast_Test` do).
@@ -510,23 +612,56 @@ hand-written register pokes.
 | # | Change | Where | Why |
 |---|---|---|---|
 | 1 | `AMOLED_QSPI_CLOCK_HZ 80000000UL` | library `AMOLED_Config.h` | doubles the bandwidth of the only real bottleneck |
-| 2 | send fewer bytes: `pushRect()` instead of `push()` | sketch | 300 kB instead of 651 kB per frame |
+| 2 | send fewer bytes: `pushRect()` instead of `push()` | sketch | 330 kB instead of 651 kB per frame |
 | 3 | `AMOLED_COLOR_DEPTH 16` | library | halves the bytes per pixel again (65k colours) |
-| 4 | `CUBE_FACES 0`, `CUBE_SHOW_FPS 0` | sketch | saves render time |
-| 5 | `AMOLED_STRIP_LINES 24…48` | library | only matters for full-frame pushes; smaller = less RAM, more transfers |
-| 6 | make sure nothing blocks | sketch | no `delay()`, serial prints guarded, `Serial.setTxTimeoutMs(0)` |
+| 4 | `CUBE_FPS_CAP 60` | sketch | not a speed-up but the biggest *quality* win: one panel pass per update, so only one tear seam exists |
+| 5 | `CUBE_FULL_WIDTH 0` | sketch | drops the full width padding of the pushed bands (~25 % fewer bytes) |
+| 6 | `CUBE_FACES 0`, `CUBE_EDGE_GLOW 0`, `CUBE_SHOW_FPS 0` | sketch | saves render time |
+| 7 | `AMOLED_STRIP_LINES 24…48` | library | only matters for full-frame pushes; smaller = less RAM, more transfers |
+| 8 | make sure nothing blocks | sketch | no `delay()`, serial prints guarded, `Serial.setTxTimeoutMs(0)` |
 
 ---
 
 # Part C — where to look next
 
 * **`README.md`** (this folder) — the installed API: every class, every method,
-  the config defines, the five examples, troubleshooting.
-* **`examples/`** — from "hello colours" (01) to the starfield (05).
-* **`F:\skeces\amoled_rotating_cube`** — the cube built on this library, with its
-  own README.
+  the config defines, the examples, the tearing notes, troubleshooting.
+* **`examples/`** — 01 Hello Colours (static test card), 02 Glow Orbs, 03
+  Contrast Test (hand written pixel loops), 04 Touch Demo, 05 Starfield
+  (streaming), 06 Rotating Cube (3D + dirty rectangle), 07 Rotating Square
+  (smallest possible animation with a frame rate counter).
+* **`F:\skeces\amoled_rotating_cube`** — the same cube as a standalone sketch,
+  with its own README, so you can hack on it without touching the library.
 * **`src/AMOLED_Config.h`** — the one file to edit: pins, colour depth, QSPI
   clock, rotation, strip size, touch, framebuffer.
+
+## C1. Next step: let the IMU hold the cube up
+
+The board carries a QMI8658 6 axis IMU on the same I2C bus as the touch
+controller, so it needs no extra wiring. The plan, in four steps:
+
+1. **Read the accelerometer.** `Wire` on the same pins as `AMOLED_Touch`
+   (SDA 47 / SCL 48), IMU address `0x6B`. Enable the accelerometer, then read six
+   bytes from the data register: accel X, Y, Z as little endian `int16`
+   (register map: `CTRL1` 0x02, `CTRL2` 0x03 for the accel range, `CTRL7` 0x08 to
+   enable, data from 0x35). *Verify the addresses against Waveshare's own IMU
+   example for this board before trusting them.*
+2. **Low pass it.** `g = g * 0.85 + gNew * 0.15` — the cube should tilt
+   smoothly, not shake with every hand movement.
+3. **Build the rotation that puts `g` onto `(0, +1, 0)`**, i.e. the "up" of the
+   cube's space. With `a` = the direction you want gravity to end up in
+   (`(0, +1, 0)`), `b = normalised g`, `v = a × b`, `c = a · b`, `s² = v · v`,
+   Rodrigues' formula gives the whole matrix in one line:
+   `R = I + [v]× + [v]×² · (1 − c) / s²`
+   (`[v]×` is the 3 × 3 skew-symmetric matrix of `v`).
+4. **Apply `R` after yaw/pitch** in `rotatePoint()`, so the cube spins in board
+   space but always keeps one corner pointing at the sky.
+
+Where it goes: a `#define CUBE_USE_IMU` block in `06_Rotating_Cube`, an
+`imuUpdate()` that runs once per frame, and `rotatePoint()` growing a second
+rotation. Everything else (the dirty rectangle, the push, the fps counter) stays
+exactly as it is — the IMU only changes the 8 corners and 6 normals that go in,
+which is the point of keeping the maths at the top of the sketch.
 
 
 

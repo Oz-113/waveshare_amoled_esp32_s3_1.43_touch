@@ -124,11 +124,41 @@ void AMOLED_Canvas::beginStrip(uint8_t *buffer, int stripY, int lines)
             _idx0 = 0;   _stepX = 1;   _stepY = W;
             break;
     }
+
+    /* the window is the whole buffer, the clip starts out as the window */
+    _wx0 = _lx0; _wy0 = _ly0; _wx1 = _lx1; _wy1 = _ly1;
+    _widx0 = _idx0;
 }
 
 void AMOLED_Canvas::beginFull(uint8_t *framebuffer)
 {
     beginStrip(framebuffer, 0, AMOLED_HEIGHT);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Clipping                                                           */
+/* ------------------------------------------------------------------ */
+
+void AMOLED_Canvas::setClip(int x0, int y0, int x1, int y1)
+{
+    /* rectangle inside the window (or nothing to draw at all) */
+    x0 = amoledClamp(x0, _wx0, _wx1);
+    x1 = amoledClamp(x1, _wx0, _wx1);
+    y0 = amoledClamp(y0, _wy0, _wy1);
+    y1 = amoledClamp(y1, _wy0, _wy1);
+    if (x0 > x1) { x0 = _wx0; x1 = _wx0 - 1; }
+    if (y0 > y1) { y0 = _wy0; y1 = _wy0 - 1; }
+
+    _lx0 = x0; _ly0 = y0; _lx1 = x1; _ly1 = y1;
+
+    /* keep ptr() valid: _idx0 is the buffer index of the clip origin */
+    _idx0 = _widx0 + (x0 - _wx0) * _stepX + (y0 - _wy0) * _stepY;
+}
+
+void AMOLED_Canvas::resetClip(void)
+{
+    _lx0 = _wx0; _ly0 = _wy0; _lx1 = _wx1; _ly1 = _wy1;
+    _idx0 = _widx0;
 }
 
 /* ------------------------------------------------------------------ */

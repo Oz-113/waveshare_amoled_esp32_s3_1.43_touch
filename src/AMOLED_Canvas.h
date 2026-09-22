@@ -184,6 +184,16 @@ public:
     /* a complete framebuffer, AMOLED_WIDTH * AMOLED_HEIGHT * AMOLED_BPP bytes */
     void beginFull(uint8_t *framebuffer);
 
+    /* Narrow the drawing area to a rectangle (intersected with the window
+     * set by beginStrip/beginFull).  Everything outside it is silently
+     * ignored - that is how you make sure a partial update really only
+     * touches the part of the picture you are going to push, and it is what
+     * a "dirty rectangle" renderer should always do. */
+    void setClip(int x0, int y0, int x1, int y1);
+
+    /* back to the whole window */
+    void resetClip(void);
+
     /* rotation in degrees: 0, 90, 180 or 270 (library wide setting) */
     static void     setRotation(uint16_t degrees);
     static uint16_t rotation(void) { return s_rotation; }
@@ -194,10 +204,16 @@ public:
     static void initTables(void);
 
     /* ----------------------------------------------------------------
-     *  Geometry
+     *  Geometry - width()/height() describe the *window* (the whole
+     *  strip / framebuffer), not the clip, so they stay put when you
+     *  temporarily narrow the drawing area with setClip().
      * ---------------------------------------------------------------- */
-    int width(void) const   { return _lx1 - _lx0 + 1; }   /* logical width  */
-    int height(void) const  { return _ly1 - _ly0 + 1; }   /* logical height */
+    int width(void) const   { return _wx1 - _wx0 + 1; }   /* logical window width  */
+    int height(void) const  { return _wy1 - _wy0 + 1; }   /* logical window height */
+    int windowX0(void) const { return _wx0; }
+    int windowY0(void) const { return _wy0; }
+    int windowX1(void) const { return _wx1; }
+    int windowY1(void) const { return _wy1; }
     int originX(void) const { return _lx0; }
     int originY(void) const { return _ly0; }
     int clipX0(void) const  { return _lx0; }
@@ -272,11 +288,17 @@ public:
     static uint8_t glowCurve(uint8_t i) { return s_glow[i]; }
 
 private:
-    uint8_t *_fb;      /* strip buffer / framebuffer                  */
-    int      _idx0;    /* buffer pixel index of logical (_lx0,_ly0)   */
-    int      _stepX;   /* buffer pixel step for one logical x         */
-    int      _stepY;   /* buffer pixel step for one logical y         */
-    int      _lx0, _ly0, _lx1, _ly1;      /* logical clip rectangle */
+    uint8_t *_fb    = nullptr;  /* strip buffer / framebuffer              */
+    int      _idx0  = 0;        /* buffer pixel index of (_lx0,_ly0)       */
+    int      _stepX = 0;        /* buffer pixel step for one logical x     */
+    int      _stepY = 0;        /* buffer pixel step for one logical y     */
+    /* the active clip rectangle; before beginStrip() it is empty, so a
+     * canvas that was never pointed at a buffer draws nothing */
+    int      _lx0 = 0, _ly0 = 0, _lx1 = -1, _ly1 = -1;
+    /* the window set by beginStrip()/beginFull(); the clip is always a
+     * rectangle inside it, and _widx0 is its buffer index */
+    int      _wx0 = 0, _wy0 = 0, _wx1 = -1, _wy1 = -1;
+    int      _widx0 = 0;
 
     static uint16_t s_rotation;        /* 0 / 90 / 180 / 270         */
     static uint8_t  s_glow[256];       /* radial falloff curve       */

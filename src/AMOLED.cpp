@@ -401,8 +401,7 @@ void AMOLED::pushRect(int x0, int y0, int x1, int y1)
      * AMOLED_STRIP_LINES rows and each band is sent as ONE transfer with a
      * window of (x0..x1, band) - that is what makes a partial update cheap:
      * a 300 x 300 box needs 10 transfers instead of 300. */
-    const int    w        = x1 - x0 + 1;
-    const size_t rowBytes = (size_t)w * AMOLED_BPP;
+    const size_t rowBytes = (size_t)(x1 - x0 + 1) * AMOLED_BPP;
 
     int y = y0;
     while (y <= y1)
@@ -410,17 +409,49 @@ void AMOLED::pushRect(int x0, int y0, int x1, int y1)
         int rows = y1 - y + 1;
         if (rows > AMOLED_STRIP_LINES) rows = AMOLED_STRIP_LINES;
 
+        /* Every transfer should be a whole number of 32 bit words: a band of
+         * a multiple of four rows always is, whatever the width of the
+         * region is, and a partial word is exactly the kind of thing that
+         * makes an SPI DMA path send a few stray bytes.  If fewer than four
+         * rows are left, four are sent and the window is slid up so it still
+         * ends on y1 - the rows it repeats hold the same pixels, so nothing
+         * is drawn twice, it is only sent twice. */
+        rows -= rows % 4;
+        if (rows == 0)
+        {
+            rows = 4;
+            y    = y1 - rows + 1;
+            if (y < 0)                       /* box at the very top: take what is left */
+            {
+                y    = 0;
+                rows = y1 + 1;
+            }
+        }
+        if (rows <= 0) break;
+
+        const size_t bytes = (size_t)rows * rowBytes;
+
         /* a strip buffer doubles as the packing buffer; taking one blocks
          * until the DMA of an earlier band has finished */
         uint8_t *buf = amoledTakeStripBuffer();
         if (!buf) return;
 
-        for (int r = 0; r < rows; r++)
+        /* a full width band is one contiguous run of the framebuffer, so it
+         * packs with a single memcpy - by far the fastest case */
+        if (x0 == 0 && x1 == AMOLED_WIDTH - 1)
         {
-            memcpy(buf + (size_t)r * rowBytes,
-                   _fb + (((size_t)(y + r) * AMOLED_WIDTH) + x0) * AMOLED_BPP,
-                   rowBytes);
+            memcpy(buf, _fb + (size_t)y * rowBytes, bytes);
         }
+        else
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                memcpy(buf + (size_t)r * rowBytes,
+                       _fb + (((size_t)(y + r) * AMOLED_WIDTH) + x0) * AMOLED_BPP,
+                       rowBytes);
+            }
+        }
+
         if (esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1 + 1, y + rows, buf) != ESP_OK)
         {
             xSemaphoreGive(s_freeStrips);

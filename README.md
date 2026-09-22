@@ -21,8 +21,10 @@ void loop() { }
   `COLMOD 0x77`. RGB565 is a one-line fallback in `AMOLED_Config.h`.
 * **Nothing to install** besides this library: it uses only the ESP-IDF
   `esp_lcd` layer that ships inside the Arduino-ESP32 core plus `Wire`.
-* **Tear-free double buffered strip pipeline**: the CPU renders strip *N+1*
-  while the QSPI DMA still sends strip *N* (`beginFrame()` / `nextStrip()`).
+* **Double buffered strip pipeline**: the CPU renders strip *N+1* while the QSPI
+  DMA still sends strip *N* (`beginFrame()` / `nextStrip()`). That removes the
+  flicker of drawing straight to the panel; the seam you may still see on a hard
+  bright edge is explained in section 2.
 * **Optional full framebuffer in PSRAM** for classic "draw, then `push()`"
   programming (651 kB, the board has 8 MB).
 * Drawing API with the usual names: `fillScreen`, `fillRect`, `drawRect`,
@@ -39,8 +41,11 @@ void loop() { }
 > numbers — what gets rendered when, and on which line the pixels are pushed to
 > the panel.
 
-Verified to compile with arduino-cli 1.5.1 + esp32 core 3.3.11 for
-`esp32:esp32:esp32s3` (16 MB flash, OPI PSRAM, USB CDC on boot).
+All **seven** examples are verified to compile with arduino-cli + esp32 core
+3.3.11 for `esp32:esp32:esp32s3` (16 MB flash, OPI PSRAM, USB CDC on boot), in
+both 24 bpp (RGB888) and 16 bpp (RGB565). The frame rate numbers in this README
+and in `GUIDE.md` are calculated from the QSPI byte budgets; the sketches print
+the measured values on their serial port.
 
 ---
 
@@ -71,6 +76,18 @@ Verified to compile with arduino-cli 1.5.1 + esp32 core 3.3.11 for
 | PSRAM | **OPI PSRAM** (needed for framebuffer mode) |
 
 No other library has to be installed.
+
+### The examples
+
+| Example | PSRAM | What it shows |
+|---|---|---|
+| `01_Hello_Colours` | no | the colour space, text, glow and arcs — a static test card |
+| `02_Glow_Orbs` | no | additive light: orbs that brighten where they overlap |
+| `03_Contrast_Test` | no | hand written pixel loops with `ptr()` / `strideX()` |
+| `04_Touch_Demo` | **yes** | touch + framebuffer + `pushRect()` (only the HUD is re-sent) |
+| `05_Starfield` | no | streaming mode, 240 points of light, hold the screen to hyperjump |
+| `06_Rotating_Cube` | **yes** | 3D: 12 glowing edges, translucent faces, dirty rectangle updates, fps counter |
+| `07_Rotating_Square` | no | the smallest animation there is: a rotated, filled square with a serial fps counter |
 
 ### arduino-cli
 ```bash
@@ -122,9 +139,55 @@ amoled.pushRect(20, 20, 120, 90);              // or just one region
 ```
 
 `push()` copies the framebuffer through the strip buffers (so it is safe on
-any board; the strips overlap internally, ~33 ms for a full frame at 40 MHz),
-`pushRect()` sends one DMA transfer per row. Both return when the framebuffer
-may be drawn into again.
+any board; the strips overlap internally, ~33 ms for a full frame at 40 MHz).
+`pushRect()` packs the region into the strip buffers in bands of
+`AMOLED_STRIP_LINES` rows and sends each band as **one** transfer, so a 300-row
+box needs 10 transfers instead of 300; a full width region (what 06 does) packs
+with a single `memcpy` per band. Every transfer is a whole number of 32 bit
+words. Both calls return when the framebuffer may be drawn into again.
+
+### Dirty rectangles, `setClip()` and tearing
+
+A partial update is only safe if **nothing draws outside the rectangle you are
+going to send** — a stray pixel that never gets pushed stays on the panel
+forever. `setClip(x0, y0, x1, y1)` is the belt-and-braces way to guarantee that:
+
+```cpp
+fb.setClip(ux0, uy0, ux1, uy1);   // nothing can escape this box now
+fb.fillRect(ux0, uy0, ux1, uy1, AMOLED_BLACK);
+drawTheMovingThing(fb);
+fb.resetClip();                   // back to the whole window
+amoled.pushRect(ux0, uy0, ux1, uy1);
+```
+
+Every primitive — including `addGlow()`, `drawText()` and hand written loops
+using `ptr()` — clamps to that rectangle. `width()`/`height()` keep describing
+the whole window, not the clip, so your layout code does not change.
+
+**Tearing.** The panel is written while it scans out, and this board has no
+tear-effect (TE) pin wired, so the seam between the new and the old part of the
+picture is always somewhere on screen. Smooth gradients hide it completely;
+hard, bright edges (a wireframe cube, a huge square) show it as a line that
+looks *cut* — and if the loop runs faster than the panel refreshes, several
+frames are in flight at once and the shape looks copied into a few horizontal
+bands.
+
+What helps, in order:
+
+1. **Keep the update rate at or below the panel's refresh rate.** At 60 updates
+   per second only one seam can be on screen; at 200 you see three or four.
+   `06_Rotating_Cube` has `CUBE_FPS_CAP` for exactly this.
+2. **Send less per frame** — the dirty rectangle (section 2b) sends a box
+   instead of 651 kB.
+3. **A faster bus** — `AMOLED_QSPI_CLOCK_HZ` 80 MHz instead of 40 halves the
+   time the panel is being written mid-scan.
+4. **A motion trail** — drawing two dimmer copies a few degrees behind the shape
+   turns the seam into blur (`SQUARE_TRAIL` in `07_Rotating_Square`).
+
+To tell tearing and rendering bugs apart: freeze the animation (`CUBE_SPIN_X`
+and `CUBE_SPIN_Y` to `0.0f`). Artifacts that disappear were tearing; artifacts
+that stay are in the drawing code.
+
 
 > Do not mix `push()`/`pushRect()` with an active streaming frame - call
 > `amoled.endFrame()` first.
@@ -172,7 +235,7 @@ may be drawn into again.
 | `bool framebufferReady()` | Is there a framebuffer? |
 | `AMOLED_Canvas &canvas()` | The canvas: framebuffer in framebuffer mode, current strip in streaming mode. |
 | `void push()` | Send the whole framebuffer (asynchronous strips). |
-| `void pushRect(x0, y0, x1, y1)` | Send one region: the rows are packed into the strip buffers in bands and each band goes out as one DMA transfer (a 300-row box needs 10 transfers, not 300). Returns when the framebuffer is free again. |
+| `void pushRect(x0, y0, x1, y1)` | Send one region: the rows are packed into the strip buffers in bands and each band goes out as one DMA transfer, always a whole number of 32 bit words (a 300-row box needs 10 transfers, not 300; a full width region packs with one `memcpy` per band). Returns when the framebuffer is free again. |
 | `uint8_t *framebufferMemory()` | Raw pointer to the framebuffer. |
 | `AMOLED_Touch &touch()` | The touch object (see section 5). |
 | `static uint32_t rgb(r,g,b)` | `amoledRGB()` shortcut. |
@@ -193,10 +256,12 @@ The colour argument is called `c` below.
 |---|---|
 | `void beginStrip(uint8_t *buf, int stripY, int lines)` | Point the canvas at one strip of screen lines (used by the driver). |
 | `void beginFull(uint8_t *buf)` | Point the canvas at a full framebuffer. |
+| `void setClip(x0, y0, x1, y1)` | Narrow the drawing area to this rectangle (intersected with the window). Everything outside is silently ignored - the safe way to do a partial update. |
+| `void resetClip()` | Back to the whole window. |
 | `static void setRotation(uint8_t deg)` | 0/90/180/270 - library wide. |
 | `static void initTables()` | Build palette/glow/arc tables (`begin()` does it for you). |
-| `int width()`, `height()` | Size of the visible (logical) area of this window. |
-| `int clipX0()`, `clipY0()`, `clipX1()`, `clipY1()` | The clipping rectangle. |
+| `int width()`, `height()` | Size of the *window* (the strip / framebuffer), unaffected by `setClip()`. |
+| `int clipX0()`, `clipY0()`, `clipX1()`, `clipY1()` | The active clipping rectangle (the window while no clip is set). |
 | `uint8_t *ptr(int x, int y)` | Address of a pixel - for your own fast loops. |
 | `int strideX()`, `strideY()` | Byte step per +1 logical x / y (negative under rotation). |
 
