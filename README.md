@@ -33,6 +33,12 @@ void loop() { }
   flicker-free hardware fade, **touch** with tap/hold helpers.
 * A single config file to edit, exactly like TFT_eSPI's `User_Setup.h`.
 
+> **`GUIDE.md`** in this folder is the long-form documentation: the maths of the
+> `amoled_rotating_cube` example, where every component comes from (Arduino core
+> / ESP-IDF / C++ / this library) and a walkthrough of the internals with line
+> numbers — what gets rendered when, and on which line the pixels are pushed to
+> the panel.
+
 Verified to compile with arduino-cli 1.5.1 + esp32 core 3.3.11 for
 `esp32:esp32:esp32s3` (16 MB flash, OPI PSRAM, USB CDC on boot).
 
@@ -166,7 +172,7 @@ may be drawn into again.
 | `bool framebufferReady()` | Is there a framebuffer? |
 | `AMOLED_Canvas &canvas()` | The canvas: framebuffer in framebuffer mode, current strip in streaming mode. |
 | `void push()` | Send the whole framebuffer (asynchronous strips). |
-| `void pushRect(x0, y0, x1, y1)` | Send one region (one DMA transfer per row, returns when the framebuffer is free again). |
+| `void pushRect(x0, y0, x1, y1)` | Send one region: the rows are packed into the strip buffers in bands and each band goes out as one DMA transfer (a 300-row box needs 10 transfers, not 300). Returns when the framebuffer is free again. |
 | `uint8_t *framebufferMemory()` | Raw pointer to the framebuffer. |
 | `AMOLED_Touch &touch()` | The touch object (see section 5). |
 | `static uint32_t rgb(r,g,b)` | `amoledRGB()` shortcut. |

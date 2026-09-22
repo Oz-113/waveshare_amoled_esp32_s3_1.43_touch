@@ -397,19 +397,35 @@ void AMOLED::pushRect(int x0, int y0, int x1, int y1)
     y1 = amoledClampI(y1, 0, AMOLED_HEIGHT - 1);
     if (x0 > x1 || y0 > y1) return;
 
-    const size_t rowBytes = (size_t)(x1 - x0 + 1) * AMOLED_BPP;
+    /* The rows of the region are packed into the strip buffers in bands of
+     * AMOLED_STRIP_LINES rows and each band is sent as ONE transfer with a
+     * window of (x0..x1, band) - that is what makes a partial update cheap:
+     * a 300 x 300 box needs 10 transfers instead of 300. */
+    const int    w        = x1 - x0 + 1;
+    const size_t rowBytes = (size_t)w * AMOLED_BPP;
 
-    for (int y = y0; y <= y1; y++)
+    int y = y0;
+    while (y <= y1)
     {
-        /* a strip buffer doubles as the packed row buffer: taking the next one
-         * blocks until the DMA of the previous row has finished */
+        int rows = y1 - y + 1;
+        if (rows > AMOLED_STRIP_LINES) rows = AMOLED_STRIP_LINES;
+
+        /* a strip buffer doubles as the packing buffer; taking one blocks
+         * until the DMA of an earlier band has finished */
         uint8_t *buf = amoledTakeStripBuffer();
         if (!buf) return;
-        memcpy(buf, _fb + ((size_t)y * AMOLED_WIDTH + x0) * AMOLED_BPP, rowBytes);
-        if (esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1 + 1, y + 1, buf) != ESP_OK)
+
+        for (int r = 0; r < rows; r++)
+        {
+            memcpy(buf + (size_t)r * rowBytes,
+                   _fb + (((size_t)(y + r) * AMOLED_WIDTH) + x0) * AMOLED_BPP,
+                   rowBytes);
+        }
+        if (esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1 + 1, y + rows, buf) != ESP_OK)
         {
             xSemaphoreGive(s_freeStrips);
         }
+        y += rows;
     }
 
     /* as soon as this returns the framebuffer may be modified again */
