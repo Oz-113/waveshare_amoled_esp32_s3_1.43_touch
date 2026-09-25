@@ -10,8 +10,8 @@ pushed to the panel.
 * **Part A** — the rotating cube project: the maths and the components.
 * **Part B** — how this library works, from your sketch down to the QSPI wires.
 * **Part C** — the IMU: how the on board QMI8658 is used to hold the cube upright.
-* **Part E** — the same IMU feeding a liquid: an N-body puddle, and how to render
-  metaballs out of nothing but additive glows.
+* **Part E** — the same IMU feeding a liquid: a grid cellular automaton, a
+  heightfield renderer, and where a full-screen sketch really spends its time.
 * **Part D** — where to find the API reference (`README.md`), the examples and
   what to build next.
 
@@ -814,22 +814,37 @@ are taken from `raw[]` — swap the indices there.
 
 ---
 
-# Part E — a liquid that obeys gravity (example 09_IMU_Fluid)
+# Part E — a grid liquid that obeys gravity (example 09_IMU_Fluid)
 
 ## E0. What it does
 
 `09_IMU_Fluid` uses the **same accelerometer reading** as Part C, for something
-that has nothing to do with a cube: a puddle of neon liquid that
+that has nothing to do with a cube: a tank of neon liquid inside the screen that
 
-* **runs to the low side of the screen** when you tilt the display,
-* **splashes** when you shake it and settles again when you stop,
-* **floats** as one drifting blob when you lay it flat, because on a flat display
-  there is no "down" left in the plane of the screen.
+* **runs to the low side** when you tilt the display, and levels out again when
+  you lay it down,
+* **sloshes and sprays** when you shake it, then settles over about a second,
+* **spreads out evenly** when the display lies flat, because then the in-plane part
+  of gravity is zero and only the levelling term is left,
+* and can be **stirred with a finger**, which also paints new liquid.
+
+The liquid is a **grid** simulation - a cellular automaton over
+`FLUID_GRID_COLS × FLUID_GRID_COLS` cells - drawn as a heightfield, so what you see
+is a continuous fluid with a pixel-smooth surface: not a field of squares, and no
+longer blobs. (The additive-glow "metaball" rendering this example used before is
+still worth reading about — it is what `02_Glow_Orbs` and `05_Starfield` do, and
+`addGlow()` is documented in README section 7.)
 
 | gesture | effect |
 |---|---|
-| tap | stir the liquid (a splash) |
+| drag | push the liquid away from your finger, and paint a little new liquid |
+| tap | next palette (constant colour / RGB by depth / thermal) |
 | hold 0.7 s | next of the four sensor → display sign variants (C4) |
+
+The simulation runs in **streaming mode**: the scene is drawn into 32 line strips
+of internal DMA RAM and each strip is sent while the next is drawn. No framebuffer,
+no PSRAM — example 09 is the one sketch in the set that does not call
+`beginFramebuffer()`.
 
 ## E1. One accelerometer, two pieces of information
 
@@ -839,98 +854,144 @@ it turns out to be a gift:
 
 | what you read | what it means | what the sketch does with it |
 |---|---|---|
-| the **direction** of the vector | where "down" is (at rest it points at the sky) | `gx = -gx · 620`, `gy = -gy · 620` px/s² of pull |
-| the **length** — `\|g\| - 1` | how hard the device is being moved, in g | `kick = shake · 1500` px/s² of random turbulence |
+| the **direction** of the vector | where "down" is (at rest it points at the sky) | the direction the automaton transports liquid in |
+| the **length** — `\|g\| - 1` | how hard the device is being moved, in g | mixes the raw vector into that direction, and scales the pull up |
 
-The direction is low passed (0.15 per sample) and only updates while `|g|` is
-within `IMU_SHAKE_G` (0.25) of 1 g, exactly as in Part C — shaking a device does
-not tell you anything about gravity. The *violence* is low passed the other way
-round: a **fast attack (0.5) and a slow release (0.06)**, so a flick appears at
-once and decays over about a second. That asymmetry is the whole "splash" effect,
-and it costs four lines.
+The direction is low passed (`IMU_FILTER` 0.25 per sample) and only updates while
+`|g|` is within `IMU_SHAKE_G` (0.25) of 1 g, exactly as in Part C — shaking a
+device does not tell you anything about gravity. The *violence* is low passed the
+other way round: a **fast attack (0.5) and a slow release (0.06)**, so a flick
+appears at once and decays over about a second. That asymmetry is the whole
+"splash" effect, and it costs four lines.
 
-Because the display's coordinate system is x right, **y down**, z into the screen,
-and `gravityDisp` is the *upward* vector in that same frame, the pull is just
-`-gravityDisp` — no axis juggling, no rotation matrix. In Part C the same vector
-had to be turned into a rotation because the cube had to be *posed*; here the
-particles only need a force.
+There is a physical subtlety here, and this example uses it: while you shake the
+board the reading *is* the acceleration, and an accelerometer measures `g - a`,
+which is exactly the vector a liquid inside would be pushed by. So the raw reading
+is mixed into the gravity direction in proportion to the shake (`FLUID_SHAKE_DIR`)
+and the pull is scaled up (`FLUID_SHAKE_BOOST`). A hard shake therefore throws the
+liquid at the far wall instead of only wobbling it - and it is not a special
+effect, it is what the sensor reports.
+
+The display's coordinate system is x right, **y down**, z into the screen, and
+`gravityDisp` is the *upward* vector in that same frame, so liquid falls along
+`-gravityDisp` — no axis juggling, no rotation matrix. Only the x and y parts can
+push liquid around inside a flat panel, so what is used is the *in-plane* part of
+that vector, and its length becomes `fluidMag`:
 
 ```
 flat on the table, screen up:   gravityDisp = (0, 0, -1)
-                                gx = gy = 0            -> nothing falls
+                                in-plane part 0   -> fluidMag 0: the levelling
+                                                     term alone spreads the
+                                                     liquid out evenly
 upright in front of you:        gravityDisp = (0, -1, 0)
-                                gy = +620 px/s²        -> it falls downwards
+                                pull (0, +1)      -> the liquid pools at the
+                                                     bottom of the tank
 ```
 
-## E2. The physics, in one function
+## E2. The simulation, in one function
 
-`fluidStep(dt, gx, gy, kick)` — five small loops, no neighbour grid, no
-integrator, no solver:
-
-1. **forces**: gravity `+g·dt`, plus `frand() · kick · dt` on both axes if the
-   device is being shaken;
-2. **droplets against each other**: for every pair (`N(N-1)/2` = 231 at 22
-   droplets) *one* smooth force curve — they attract while
-   `r1+r2 ≤ d < 1.8(r1+r2)`, it is strongest at the touching distance, and the
-   soft repulsion below it is what keeps the puddle from collapsing into a point.
-   That is the puddle's "body", and it is the only fluid-like rule in the file;
-3. **viscosity** `v *= 1/(1 + 1.3·dt)` (frame rate independent, unlike a fixed
-   `v *= 0.98`), a hard speed clamp so one long frame cannot explode the
-   simulation, and a little extra drag below `FLUID_POOL_MIN` so a settled puddle
-   really does come to rest instead of shivering;
-4. **the wall**: a radial test against `arenaR - r`, the droplet is put back
-   inside, the *radial* component of its velocity is reflected with
-   `FLUID_WALL_BOUNCE` (0.42) and both components lose 6 % to friction;
-5. **move and light up**: position `+= v·dt`, and the droplet's brightness
-   follows `|v| / FLUID_MAX_SPEED`, so fast liquid glows and still liquid is dim.
-   The motion *is* the light — that is what makes a splash read as a splash.
-
-## E3. The renderer: metaballs for free
-
-An AMOLED adds light, so *overlapping glows are already a metaball field*:
+`fluidStep(ux, uy, mag)` — a single sweep over the grid. No matrix, no velocity
+field, no pressure solve:
 
 ```
-   22 droplets, each drawn twice                     what you see
-   +-------------------------------+
-   | addGlow(x, y, 54, hue,  62)   |  wide, dim halo   ->  neighbours merge
-   | addGlow(x, y, 21, hue, 200)   |  tight, bright    ->  the body / core
-   +-------------------------------+
+    flow = (my mass - the neighbour's mass) * weight * rate
 ```
 
-No field is evaluated, no grid is sampled, no threshold is applied at any
-resolution — the sum of the light *is* the surface, and the droplet's physical
-radius (18 px) is deliberately much smaller than its light radius (54 px) so the
-bodies can huddle while their glows overlap. That is the whole trick, and it is
-also why the sketch is fast: a glow costs one multiply, one shift and one table
-lookup per pixel of its box (`AMOLED_Canvas::addGlow`), so 22 of them are ~2 ms.
+* **mass** is what a cell holds, measured in cells (1.0 = a full cell). The height
+  of the liquid in a cell *is* its mass, so a height difference between two
+  neighbours is a pressure difference - that is the entire reason a rule this
+  small behaves like a liquid.
+* **weight** of a direction is `FLUID_LEVELING` (a constant: a liquid wants to be
+  flat, and this is what lets it flow sideways into a hollow) plus
+  `FLUID_GRAVITY_BIAS · max(0, u · dir)`, i.e. gravity only ever makes a direction
+  *easier*. Each rate is the direction's weight divided by the sum of all four, so
+  the weights are relative, never absolute.
+* **rate** is `FLUID_FLOW_RATE` of the difference, clamped twice: to
+  `FLUID_MAX_FLOW` cells per substep in one direction (the viscosity that keeps a
+  splash from exploding), and to what the cell actually holds.
+* **conservation is exact.** Every flow is applied as one subtraction and one
+  addition of the same number into a delta array, and that array is applied to the
+  mass field afterwards - so the total amount of liquid cannot drift, whatever
+  order the sweep runs in. The total is on the serial line once a second
+  (`liquid …`) and it stays put.
+* **`FLUID_VISCOSITY`** runs the same head-difference rule once more with pure
+  levelling weights, which rounds off the grid's staircase and makes the liquid a
+  little thicker.
+* **time**: one substep is `FLUID_PHYS_MS` (16.6 ms) of simulated time and the
+  number of substeps follows the measured frame time (up to `FLUID_MAX_SUBSTEPS`),
+  so the liquid moves at the same speed at 20 fps and at 60.
 
-The hue of a droplet is its place in the ramp (`FLUID_HUE_SPREAD`) plus a term
-proportional to where it is on the screen (`FLUID_HUE_TWIST`), so a settled puddle
-shows a smooth sweep of colour instead of one flat tint; the areas where several
-glows overlap saturate towards white, which reads as a hot spot and not as a bug.
+The tank is a disc (`FLUID_TANK_ROUND`, radius `FLUID_TANK_RADIUS`): cells whose
+centre is outside it count as "outside" and neither give nor receive liquid, which
+is what makes the liquid pool in a bowl instead of a box. `fluidReset()` pours in
+`FLUID_FILL_PCT` percent of the tank's cells, spread evenly along each row, so a
+fill below one cell per row becomes a thin film rather than a stripe.
 
-## E4. Why it stays at 60 fps
+## E3. The renderer: a heightfield out of a grid
 
-The sketch is a textbook dirty-rectangle application of B4, with the same push
-modes as Part A5:
+The simulation is a grid, the picture is not, and that is entirely the renderer's
+doing. Once per frame, `fluidPlan()`:
 
-| knob | effect |
+1. picks the axis gravity pulls along, then walks every line of the grid **across**
+   it and adds up the mass of the cells connected to the floor. That sum is the
+   height of the liquid in that line;
+2. cuts that height into `FLUID_SHADE_BANDS` bands and turns each band into **one
+   rectangle for the whole line**, not one per cell - which is why a 40 × 40 grid
+   costs about 130 rectangle fills per frame instead of 1600;
+3. draws everything that holds mass but is *not* connected to the floor - spray
+   thrown up by a shake - as a small square per cell, sized by how much it holds;
+4. adds the meniscus: a two pixel additive line where the liquid meets the air,
+   which is what makes the surface read as a surface.
+
+Because the sweep follows gravity, a display lying on its side pools against the
+left or right wall using the very same code, and every run is clamped to the tank's
+pixel span in that direction, so the liquid never leaves the circle.
+
+Colour comes from one function, `fluidColour(t, rel, surface)`, with three
+palettes: `0` a constant colour whose brightness follows depth, `1` RGB (the hue
+travels `FLUID_HUE_DEPTH` degrees from the floor to the surface and drifts with
+time), `2` thermal (the base colour, white hot at the surface and in the spray).
+`FLUID_SHADE_BANDS 1` collapses the whole body to one flat rectangle per line, if
+you want the cheapest possible look.
+
+## E4. Why this is fast, and what the numbers mean
+
+Two decisions do all the work:
+
+* **streaming mode.** The scene goes into 32 line strips of internal DMA RAM and
+  each strip is sent while the next one is drawn. There is no 651 kB framebuffer in
+  PSRAM to draw into and to copy out again - for C-style per-pixel code that copy
+  is usually a bigger cost than the maths itself.
+* **rectangle fills instead of per-pixel maths.** 130-200 `fillRect()` calls paint
+  the liquid (about 1 ms for a full screen worth of pixels), and the automaton
+  itself is about 0.4 ms per substep at 40 × 40.
+
+The sketch measures itself: `FLUID_SHOW_PROFILE` puts the numbers on the screen and
+the same line goes to the serial port once a second.
+
+| field | meaning |
 |---|---|
-| `FLUID_COUNT` | droplets: both the puddle's volume and 4-5 % of a millisecond each |
-| `FLUID_RADIUS` | the glow's **area** is what costs (a radius of 54 px is a 108×108 box) |
-| `FLUID_DETAIL 0` | drops the wide halo, keeps the bright centre: about 40 % less pixel work |
-| `FLUID_FPS_CAP 60` | the anti-tearing limit of Part A6 |
-| `FLUID_FULL_WIDTH 1` | pushes full width bands (the streaming shape) instead of a tight box |
+| `FPS` | frames per second over the last second |
+| `PHY` | the automaton, all substeps of this frame (ms) |
+| `PLN` | grid → rectangle list (ms) |
+| `DRW` | drawing the strips on the CPU (ms) |
+| `DMA` | the rest of the frame: QSPI, the overlap, and waiting for a strip buffer |
+| `MB/s` | `W · H · 3 bytes / frame time` — the bandwidth the panel is really getting |
 
-Everything else is a real cost too, but a small one: 231 pair checks × 2 substeps
-(≈0.1 ms), a ring of 512 stamps (≈0.4 ms), and one I2C read of two bytes for the
-IMU (tens of µs).
+The last one is the honest one, and it is the answer to "can this be faster". A
+full frame is 466 · 466 · 3 = 651 kB, so at the library's 80 MHz QSPI
+(`AMOLED_QSPI_CLOCK_HZ`) the transfer time alone is ~16 ms: **55-60 fps is the hard
+ceiling of a full-screen update**, and at 40 MHz it is ~33 ms, i.e. about 30 fps.
+If `MB/s` is near 33 the bus is healthy and `FPS` is telling the truth about it; if
+it is far below that, the panel is running slower than configured, or something
+else is holding the CPU (a blocked USB CDC write, for example).
 
-One structural detail worth copying: the **arena ring is static, but it is
-re-drawn every frame inside the clip**. The erase pass paints the dirty rectangle
-black and it has no idea that a ring was passing through it, so anything static
-inside the dirty region has to be repainted — the same reason `08_IMU_Cube`
-repaints its text boxes whenever the cube's box reaches them (`overlaps()` here).
+A sketch that pushes a full screen every frame cannot be sped up by making the
+simulation cheaper - only by not pushing the screen. That is exactly why the
+*previous* version of this example (22 additive glows written into a PSRAM
+framebuffer, then pushed in bands) measured far lower than the bus allows: per-pixel
+float maths in PSRAM, plus a PSRAM → internal RAM copy on every push, dwarf the
+QSPI transfer they are meant to feed.
 
 ## E5. Where each piece lives in the sketch
 
@@ -940,18 +1001,22 @@ repaints its text boxes whenever the cube's box reaches them (`overlaps()` here)
 | chip bring-up | `imuBegin()` | WHO_AM_I at `0x6B`/`0x6A`, four register writes |
 | one sample | `imuReadRaw()` | STATUS0 bit 0, then a 6 byte burst, converted to g |
 | direction **and** violence | `imuUpdate()` | fast attack / slow release, and the shake gate for the direction |
-| gravity → pull | three lines in `loop()` step 2 | `gx = -gx · FLUID_GRAVITY` … |
-| the puddle | `fluidReset()`, `fluidStep()` | spiral start, then the five loops of E2 |
-| the liquid | `drawFluid()` | two `addGlow()` calls per droplet |
-| the wall | `drawRing()` | two `addArc()` calls, re-drawn inside the clip |
-| the readouts | `drawFpsText()`, `drawHintText()`, `drawImuText()`, `pushTextBox()` | each pushes only its own little box when it changes |
-| the loop | steps 0…8 | frame cap, touch, IMU, gravity, physics, dirty box, erase + `setClip`, draw, push, readouts |
+| gravity → the automaton | `fluidGravityUpdate()` | in-plane part of `-gravityDisp`, shake mixed in by `FLUID_SHAKE_DIR` |
+| the grid and the tank | `fluidGridBuild()` | cell size, round mask, per line cell and pixel spans |
+| pouring the liquid in | `fluidReset()` | `FLUID_FILL_PCT` of the tank's cells, spread along each row |
+| the simulation | `fluidStep()`, `fluidRelax()`, `fluidApplyDelta()` | the rule of E2, `FLUID_MAX_SUBSTEPS` times per frame |
+| painting with a finger | `fluidPaint()` | adds mass under the touch |
+| grid → rectangles | `fluidPlan()` | the heightfield of E3, bands, meniscus, spray |
+| the picture | `fluidDrawStrip()`, `hudText()`, `hudTextCentered()` | one strip per call, screen coordinates, clipped by the canvas |
+| the readouts | `fluidBuildFpsLine()`, `fluidBuildProfileLine()`, `fluidBuildImuLine()` | rebuilt when they change, drawn inside every strip |
+| the loop | the sections of `loop()` | input, simulate, plan, draw, timing, readout, serial commands, frame cap |
 
 Library API used, and nothing else: `begin()`, `setBrightness()`,
-`beginFramebuffer()`, `canvas()`, `setClip()`/`resetClip()`, `fillRect()`,
-`addGlow()`, `addArc()`, `drawText()`, `textWidth()`, `pushRect()`, `push()`,
-`touch().update()/tapped()/heldOnce()`, plus the colour helpers `amoledHSV()`,
-`amoledScale()` and `amoledRGB()`.
+`beginFrame()`/`nextStrip()`/`pushStrip()`/`endFrame()`/`waitIdle()`, `canvas()`,
+`fillScreen()`, `fillRect()`, `addRect()`, `addCircle()`, `windowY0()`,
+`windowY1()`, `drawTextBlend()`, `textWidth()`,
+`touch().update()/tapped()/heldOnce()/isDown()/x()/y()`, plus the colour helpers
+`amoledHSV()`, `amoledScale()`, `amoledMix()` and `amoledRGB()`.
 
 
 # Part D — where to look next
@@ -962,8 +1027,9 @@ Library API used, and nothing else: `begin()`, `setBrightness()`,
   Contrast Test (hand written pixel loops), 04 Touch Demo, 05 Starfield
   (streaming), 06 Rotating Cube (3D wireframe + dirty rectangle), 07 Rotating
   Square (smallest possible animation with a frame rate counter), 08 IMU Cube
-  (the cube held upright by gravity), 09 IMU Fluid (an N-body liquid that pools,
-  splashes and floats, rendered as 22 additive glows).
+  (the cube held upright by gravity), 09 IMU Fluid (a grid liquid that pools,
+  splashes and spreads, simulated in a cellular automaton and drawn as a
+  heightfield in streaming mode).
 * **`F:\skeces\amoled_rotating_cube`**, **`F:\skeces\amoled_imu_cube`** and
   **`F:\skeces\amoled_imu_fluid`** — the same sketches as standalone projects with
   their own READMEs, so you can hack on them without touching the library.

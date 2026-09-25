@@ -89,7 +89,7 @@ No other library has to be installed.
 | `06_Rotating_Cube` | **yes** | 3D wireframe cube (set `CUBE_FACES 1` for the translucent faces), dirty rectangle updates, fps counter |
 | `07_Rotating_Square` | no | the smallest animation there is: a rotated, filled square with a serial fps counter |
 | `08_IMU_Cube` | **yes** | the same cube held upright by the on board QMI8658 accelerometer: it hangs from real gravity and spins about the world vertical (tap = freeze, hold = axis signs) |
-| `09_IMU_Fluid` | **yes** | a neon liquid driven by the same accelerometer: it pools at the low side of the screen, splashes when you shake it, and floats when you lay it flat (tap = stir, hold = axis signs) |
+| `09_IMU_Fluid` | n | a **grid** liquid: a cellular automaton over a 40 x 40 cell tank, drawn as a heightfield, driven by the same accelerometer — it pools at the low side, splashes when you shake it and spreads out when you lay it flat (drag = push, tap = palette, hold = axis signs). Streaming mode, so no framebuffer |
 
 ### arduino-cli
 ```bash
@@ -415,9 +415,8 @@ beginFrame() / nextStrip() / pushStrip() pipeline:
   which is why `fadeBrightness()` looks like a real fade.
 * A glow costs one multiply, one shift and one table lookup per pixel of its
   bounding box, and an AMOLED *adds* light, so overlapping glows merge into one
-  bright body. `09_IMU_Fluid` builds a whole metaball-looking liquid out of 22 of
-  them; `FLUID_COUNT` and `FLUID_RADIUS` (its area is what costs) are the two
-  knobs that trade the look against the frame rate.
+  bright body. `02_Glow_Orbs` and `05_Starfield` are built out of that;
+  `addGlow()`'s two knobs are its radius (the area is what costs) and its gain.
 
 ---
 
@@ -433,7 +432,7 @@ beginFrame() / nextStrip() / pushStrip() pipeline:
 | `06_Rotating_Cube` | Framebuffer mode + dirty rectangle + `setClip()`/`pushRect()`: a 3D wireframe cube with Lambert shading, depth fog and a rainbow, and an fps counter. Set `CUBE_FACES 1` for the translucent additive faces. |
 | `07_Rotating_Square` | The smallest animation there is: one rotated, filled square, streaming vs framebuffer, and a 1-pixel tear/trail experiment (`SQUARE_TRAIL`). |
 | `08_IMU_Cube` | The QMI8658 accelerometer read directly over I2C: the cube is rotated onto the measured gravity by the *shortest* arc (Rodrigues), so it keeps its top face at the sky and stands still in the room while the screen turns around it. |
-| `09_IMU_Fluid` | The same accelerometer, a completely different use: an N-body puddle of additive glows that falls along gravity, splashes on `|g| - 1` and merges into one blob when the display is flat. Also the cheapest possible "metaball" renderer and a worked example of tuning a sketch for frame rate. |
+| `09_IMU_Fluid` | The same accelerometer, a completely different use: a **grid liquid**. A cellular automaton moves mass between neighbouring cells of a 40 x 40 tank, gravity biases the flow, and a heightfield renderer turns that grid into ~150 rectangles per frame — so it *looks* like a fluid while the physics stays a few hundred microseconds. Streaming mode (no framebuffer, no PSRAM), with a measured breakdown of where the frame time actually goes, which is the honest way to tune a full-screen sketch. Drag to push the liquid, tap for the palette, hold for the axis signs. |
 
 ---
 
