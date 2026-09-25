@@ -1,18 +1,21 @@
 # WaveshareAMOLED — the guide
 
 Everything about this library and about the cube demos (examples
-`06_Rotating_Cube` / `08_IMU_Cube` and the standalone copies in
-`F:\skeces\amoled_rotating_cube` / `F:\skeces\amoled_imu_cube`): the maths, the
-drawing, what each component is, which library or API it comes from, and what
-happens on which line when a frame is rendered and pushed to the panel.
+`06_Rotating_Cube` / `08_IMU_Cube`, the fluid of `09_IMU_Fluid`, and the
+standalone copies in `F:\skeces\amoled_rotating_cube` / `amoled_imu_cube` /
+`amoled_imu_fluid`): the maths, the drawing, what each component is, which library
+or API it comes from, and what happens on which line when a frame is rendered and
+pushed to the panel.
 
 * **Part A** — the rotating cube project: the maths and the components.
 * **Part B** — how this library works, from your sketch down to the QSPI wires.
 * **Part C** — the IMU: how the on board QMI8658 is used to hold the cube upright.
+* **Part E** — the same IMU feeding a liquid: an N-body puddle, and how to render
+  metaballs out of nothing but additive glows.
 * **Part D** — where to find the API reference (`README.md`), the examples and
   what to build next.
 
-> Line numbers refer to **library version 1.0.3**. They are here to help you
+> Line numbers refer to **library version 1.0.4**. They are here to help you
 > read the code, not as a permanent contract — if you edit a file they move.
 
 
@@ -811,6 +814,146 @@ are taken from `raw[]` — swap the indices there.
 
 ---
 
+# Part E — a liquid that obeys gravity (example 09_IMU_Fluid)
+
+## E0. What it does
+
+`09_IMU_Fluid` uses the **same accelerometer reading** as Part C, for something
+that has nothing to do with a cube: a puddle of neon liquid that
+
+* **runs to the low side of the screen** when you tilt the display,
+* **splashes** when you shake it and settles again when you stop,
+* **floats** as one drifting blob when you lay it flat, because on a flat display
+  there is no "down" left in the plane of the screen.
+
+| gesture | effect |
+|---|---|
+| tap | stir the liquid (a splash) |
+| hold 0.7 s | next of the four sensor → display sign variants (C4) |
+
+## E1. One accelerometer, two pieces of information
+
+Part C throws one thing away: any sample whose magnitude is not ~1 g is ignored,
+because it is movement and not gravity. This example keeps that information, and
+it turns out to be a gift:
+
+| what you read | what it means | what the sketch does with it |
+|---|---|---|
+| the **direction** of the vector | where "down" is (at rest it points at the sky) | `gx = -gx · 620`, `gy = -gy · 620` px/s² of pull |
+| the **length** — `\|g\| - 1` | how hard the device is being moved, in g | `kick = shake · 1500` px/s² of random turbulence |
+
+The direction is low passed (0.15 per sample) and only updates while `|g|` is
+within `IMU_SHAKE_G` (0.25) of 1 g, exactly as in Part C — shaking a device does
+not tell you anything about gravity. The *violence* is low passed the other way
+round: a **fast attack (0.5) and a slow release (0.06)**, so a flick appears at
+once and decays over about a second. That asymmetry is the whole "splash" effect,
+and it costs four lines.
+
+Because the display's coordinate system is x right, **y down**, z into the screen,
+and `gravityDisp` is the *upward* vector in that same frame, the pull is just
+`-gravityDisp` — no axis juggling, no rotation matrix. In Part C the same vector
+had to be turned into a rotation because the cube had to be *posed*; here the
+particles only need a force.
+
+```
+flat on the table, screen up:   gravityDisp = (0, 0, -1)
+                                gx = gy = 0            -> nothing falls
+upright in front of you:        gravityDisp = (0, -1, 0)
+                                gy = +620 px/s²        -> it falls downwards
+```
+
+## E2. The physics, in one function
+
+`fluidStep(dt, gx, gy, kick)` — five small loops, no neighbour grid, no
+integrator, no solver:
+
+1. **forces**: gravity `+g·dt`, plus `frand() · kick · dt` on both axes if the
+   device is being shaken;
+2. **droplets against each other**: for every pair (`N(N-1)/2` = 231 at 22
+   droplets) *one* smooth force curve — they attract while
+   `r1+r2 ≤ d < 1.8(r1+r2)`, it is strongest at the touching distance, and the
+   soft repulsion below it is what keeps the puddle from collapsing into a point.
+   That is the puddle's "body", and it is the only fluid-like rule in the file;
+3. **viscosity** `v *= 1/(1 + 1.3·dt)` (frame rate independent, unlike a fixed
+   `v *= 0.98`), a hard speed clamp so one long frame cannot explode the
+   simulation, and a little extra drag below `FLUID_POOL_MIN` so a settled puddle
+   really does come to rest instead of shivering;
+4. **the wall**: a radial test against `arenaR - r`, the droplet is put back
+   inside, the *radial* component of its velocity is reflected with
+   `FLUID_WALL_BOUNCE` (0.42) and both components lose 6 % to friction;
+5. **move and light up**: position `+= v·dt`, and the droplet's brightness
+   follows `|v| / FLUID_MAX_SPEED`, so fast liquid glows and still liquid is dim.
+   The motion *is* the light — that is what makes a splash read as a splash.
+
+## E3. The renderer: metaballs for free
+
+An AMOLED adds light, so *overlapping glows are already a metaball field*:
+
+```
+   22 droplets, each drawn twice                     what you see
+   +-------------------------------+
+   | addGlow(x, y, 54, hue,  62)   |  wide, dim halo   ->  neighbours merge
+   | addGlow(x, y, 21, hue, 200)   |  tight, bright    ->  the body / core
+   +-------------------------------+
+```
+
+No field is evaluated, no grid is sampled, no threshold is applied at any
+resolution — the sum of the light *is* the surface, and the droplet's physical
+radius (18 px) is deliberately much smaller than its light radius (54 px) so the
+bodies can huddle while their glows overlap. That is the whole trick, and it is
+also why the sketch is fast: a glow costs one multiply, one shift and one table
+lookup per pixel of its box (`AMOLED_Canvas::addGlow`), so 22 of them are ~2 ms.
+
+The hue of a droplet is its place in the ramp (`FLUID_HUE_SPREAD`) plus a term
+proportional to where it is on the screen (`FLUID_HUE_TWIST`), so a settled puddle
+shows a smooth sweep of colour instead of one flat tint; the areas where several
+glows overlap saturate towards white, which reads as a hot spot and not as a bug.
+
+## E4. Why it stays at 60 fps
+
+The sketch is a textbook dirty-rectangle application of B4, with the same push
+modes as Part A5:
+
+| knob | effect |
+|---|---|
+| `FLUID_COUNT` | droplets: both the puddle's volume and 4-5 % of a millisecond each |
+| `FLUID_RADIUS` | the glow's **area** is what costs (a radius of 54 px is a 108×108 box) |
+| `FLUID_DETAIL 0` | drops the wide halo, keeps the bright centre: about 40 % less pixel work |
+| `FLUID_FPS_CAP 60` | the anti-tearing limit of Part A6 |
+| `FLUID_FULL_WIDTH 1` | pushes full width bands (the streaming shape) instead of a tight box |
+
+Everything else is a real cost too, but a small one: 231 pair checks × 2 substeps
+(≈0.1 ms), a ring of 512 stamps (≈0.4 ms), and one I2C read of two bytes for the
+IMU (tens of µs).
+
+One structural detail worth copying: the **arena ring is static, but it is
+re-drawn every frame inside the clip**. The erase pass paints the dirty rectangle
+black and it has no idea that a ring was passing through it, so anything static
+inside the dirty region has to be repainted — the same reason `08_IMU_Cube`
+repaints its text boxes whenever the cube's box reaches them (`overlaps()` here).
+
+## E5. Where each piece lives in the sketch
+
+| Piece | In `09_IMU_Fluid` | Notes |
+|---|---|---|
+| the I2C helpers | `imuRead()`, `imuWrite()` | identical to Part C — plain `Wire` |
+| chip bring-up | `imuBegin()` | WHO_AM_I at `0x6B`/`0x6A`, four register writes |
+| one sample | `imuReadRaw()` | STATUS0 bit 0, then a 6 byte burst, converted to g |
+| direction **and** violence | `imuUpdate()` | fast attack / slow release, and the shake gate for the direction |
+| gravity → pull | three lines in `loop()` step 2 | `gx = -gx · FLUID_GRAVITY` … |
+| the puddle | `fluidReset()`, `fluidStep()` | spiral start, then the five loops of E2 |
+| the liquid | `drawFluid()` | two `addGlow()` calls per droplet |
+| the wall | `drawRing()` | two `addArc()` calls, re-drawn inside the clip |
+| the readouts | `drawFpsText()`, `drawHintText()`, `drawImuText()`, `pushTextBox()` | each pushes only its own little box when it changes |
+| the loop | steps 0…8 | frame cap, touch, IMU, gravity, physics, dirty box, erase + `setClip`, draw, push, readouts |
+
+Library API used, and nothing else: `begin()`, `setBrightness()`,
+`beginFramebuffer()`, `canvas()`, `setClip()`/`resetClip()`, `fillRect()`,
+`addGlow()`, `addArc()`, `drawText()`, `textWidth()`, `pushRect()`, `push()`,
+`touch().update()/tapped()/heldOnce()`, plus the colour helpers `amoledHSV()`,
+`amoledScale()` and `amoledRGB()`.
+
+
 # Part D — where to look next
 
 * **`README.md`** (this folder) — the installed API: every class, every method,
@@ -819,10 +962,11 @@ are taken from `raw[]` — swap the indices there.
   Contrast Test (hand written pixel loops), 04 Touch Demo, 05 Starfield
   (streaming), 06 Rotating Cube (3D wireframe + dirty rectangle), 07 Rotating
   Square (smallest possible animation with a frame rate counter), 08 IMU Cube
-  (the cube held upright by gravity).
-* **`F:\skeces\amoled_rotating_cube`** and **`F:\skeces\amoled_imu_cube`** — the
-  two cube sketches as standalone projects with their own READMEs, so you can
-  hack on them without touching the library.
+  (the cube held upright by gravity), 09 IMU Fluid (an N-body liquid that pools,
+  splashes and floats, rendered as 22 additive glows).
+* **`F:\skeces\amoled_rotating_cube`**, **`F:\skeces\amoled_imu_cube`** and
+  **`F:\skeces\amoled_imu_fluid`** — the same sketches as standalone projects with
+  their own READMEs, so you can hack on them without touching the library.
 * **`src/AMOLED_Config.h`** — the one file to edit: pins, colour depth, QSPI
   clock, rotation, strip size, touch, framebuffer.
 * **Ideas that would be next**, roughly in order of payoff:
@@ -831,9 +975,13 @@ are taken from `raw[]` — swap the indices there.
      lines), which makes the cube follow quick rotations without lag;
   2. **throw gestures**: integrate the gyro on a flick and let the cube spin on,
      decaying over a second or two;
-  3. a **spirit level** or a bubble level screen — the same `gravityDisp` vector,
-     a completely different use;
-  4. the shape itself: the same maths drives any set of vertices, so a second
+  3. carry that gyro rate into **`09_IMU_Fluid`**: with the angular velocity known
+     the liquid could carry a real inertia (it would run to the wall as you turn
+     the display and slosh *back* when you stop), instead of only reacting to the
+     tilt it can currently see;
+  4. a **spirit level** or bubble level screen — the same `gravityDisp` vector,
+     a completely different use, and about thirty lines of canvas code;
+  5. the shape itself: the same maths drives any set of vertices, so a second
      example could swap the cube for a tetrahedron or a pyramid with two tables
      changed.
 

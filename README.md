@@ -41,7 +41,7 @@ void loop() { }
 > numbers — what gets rendered when, and on which line the pixels are pushed to
 > the panel.
 
-All **eight** examples are verified to compile with arduino-cli + esp32 core
+All **nine** examples are verified to compile with arduino-cli + esp32 core
 3.3.11 for `esp32:esp32:esp32s3` (16 MB flash, OPI PSRAM, USB CDC on boot), in
 both 24 bpp (RGB888) and 16 bpp (RGB565). The frame rate numbers in this README
 and in `GUIDE.md` are calculated from the QSPI byte budgets; the sketches print
@@ -89,6 +89,7 @@ No other library has to be installed.
 | `06_Rotating_Cube` | **yes** | 3D wireframe cube (set `CUBE_FACES 1` for the translucent faces), dirty rectangle updates, fps counter |
 | `07_Rotating_Square` | no | the smallest animation there is: a rotated, filled square with a serial fps counter |
 | `08_IMU_Cube` | **yes** | the same cube held upright by the on board QMI8658 accelerometer: it hangs from real gravity and spins about the world vertical (tap = freeze, hold = axis signs) |
+| `09_IMU_Fluid` | **yes** | a neon liquid driven by the same accelerometer: it pools at the low side of the screen, splashes when you shake it, and floats when you lay it flat (tap = stir, hold = axis signs) |
 
 ### arduino-cli
 ```bash
@@ -412,6 +413,11 @@ beginFrame() / nextStrip() / pushStrip() pipeline:
   buffer, no extra transfer, about one add per pixel.
 * Brightness is a controller register (`0x51`), not PWM: it reacts instantly,
   which is why `fadeBrightness()` looks like a real fade.
+* A glow costs one multiply, one shift and one table lookup per pixel of its
+  bounding box, and an AMOLED *adds* light, so overlapping glows merge into one
+  bright body. `09_IMU_Fluid` builds a whole metaball-looking liquid out of 22 of
+  them; `FLUID_COUNT` and `FLUID_RADIUS` (its area is what costs) are the two
+  knobs that trade the look against the frame rate.
 
 ---
 
@@ -424,6 +430,10 @@ beginFrame() / nextStrip() / pushStrip() pipeline:
 | `03_Contrast_Test` | The full test card: grey ramp, darkest/brightest 16 levels, moving 1-pixel checkerboard, frequency sweep, 24 bit hue sweep. |
 | `04_Touch_Demo` | Touch: raw read, tap and hold gestures, an on-screen status panel updated with `pushRect()` only. |
 | `05_Starfield` | 240 additive point lights with streaks, `held()` as a warp lever. |
+| `06_Rotating_Cube` | Framebuffer mode + dirty rectangle + `setClip()`/`pushRect()`: a 3D wireframe cube with Lambert shading, depth fog and a rainbow, and an fps counter. Set `CUBE_FACES 1` for the translucent additive faces. |
+| `07_Rotating_Square` | The smallest animation there is: one rotated, filled square, streaming vs framebuffer, and a 1-pixel tear/trail experiment (`SQUARE_TRAIL`). |
+| `08_IMU_Cube` | The QMI8658 accelerometer read directly over I2C: the cube is rotated onto the measured gravity by the *shortest* arc (Rodrigues), so it keeps its top face at the sky and stands still in the room while the screen turns around it. |
+| `09_IMU_Fluid` | The same accelerometer, a completely different use: an N-body puddle of additive glows that falls along gravity, splashes on `|g| - 1` and merges into one blob when the display is flat. Also the cheapest possible "metaball" renderer and a worked example of tuning a sketch for frame rate. |
 
 ---
 
