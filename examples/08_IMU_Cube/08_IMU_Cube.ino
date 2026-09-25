@@ -88,7 +88,7 @@
 /*  IMU knobs (QMI8658, same I2C bus as the touch panel)              */
 /* ================================================================== */
 #define CUBE_IMU_ENABLE   1        /* 0 = no IMU, use the two axis spin      */
-#define IMU_SIGN_VARIANT  1        /* start value, see kImuSigns[] below.    */
+#define IMU_SIGN_VARIANT  4        /* start value, see kImuSigns[] below.    */
                                    /* Long press cycles it at run time.      */
 #define IMU_FILTER        0.15f    /* weight of each new sample, 0..1        */
 #define IMU_SHAKE_G       0.25f    /* ignore samples whose magnitude is off  */
@@ -938,15 +938,18 @@ void loop()
     {
         const int   a = kEdge[e][0], b = kEdge[e][1];
         const float d = 0.5f * (depth[a] + depth[b]);
-        drawEdge(fb, scrX[a], scrY[a], scrX[b], scrY[b],
-                 hueColour(hueBase + e * 13.0f + 12.0f, 0.45f + 0.55f * depthFactor(d)));
-    }
+    // drawEdge(fb, scrX[a], scrY[a], scrX[b], scrY[b], hueColour(hueBase + e * 13.0f + 12.0f, 0.45f + 0.55f * depthFactor(d)));
+    drawEdge(fb, scrX[a], scrY[a], scrX[b], scrY[b],0x00FF00);
+    
+      
+        }
 
     /* the eight corners glow like neon junctions */
     for (int i = 0; i < 8; i++)
     {
-        fb.addGlow(scrX[i], scrY[i], 13,
-                   hueColour(hueBase + i * 17.0f, 0.85f * depthFactor(depth[i])), 200);
+        fb.addGlow(scrX[i], scrY[i], 20,                                            // corner glow
+              //     hueColour(hueBase + i * 17.0f, 0.85f * depthFactor(depth[i])), 200);
+              0x00FF00);
     }
 
     fb.resetClip();                 /* back to the whole framebuffer */

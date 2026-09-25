@@ -2,33 +2,61 @@
  * 09_IMU_Fluid - WaveshareAMOLED library
  * ============================================================================
  *  A tank of neon liquid inside the screen that always runs to the low side of
- *  the display.
+ *  the display, and sloshes while you move it.
  *
- *  This is a real grid simulation, not a pile of glowing blobs.  The screen is
- *  cut into FLUID_GRID_COLS x FLUID_GRID_COLS cells, every cell stores an amount
- *  of liquid ("mass"), and once per frame the liquid is redistributed between
- *  neighbouring cells:
+ *  This is a real liquid solver on a grid - not a pile of glowing blobs, and
+ *  not a "hand the mass to the neighbour" relaxation.  The screen is cut into
+ *  FLUID_GRID_COLS x FLUID_GRID_COLS cells; every cell holds a *depth* of
+ *  liquid in pixels, and every edge between two cells holds a *flow*: the
+ *  amount of liquid that crossed that edge during the last step.
  *
- *      a cell gives liquid to a neighbour when it holds more than the neighbour
- *      (that height difference is what a real liquid calls pressure), and the
- *      direction of gravity decides how much easier it is to give in that
- *      direction than in the others.
+ *  One step of the solver is the classic pipe model of water in a sandbox:
  *
- *  That single rule, run a few times per frame, produces everything you see: a
- *  level surface, a puddle that runs to the low side when you tilt, waves that
- *  slosh back and forth, spray when you shake it, and a still flat layer when
- *  the display lies flat on the table (then there is no in-plane gravity left,
- *  so only the pressure term acts and the liquid spreads out evenly).
+ *      flux  = flux * FLUID_DAMP
+ *            + FLUID_FLOW * ( potential(this cell) - potential(neighbour) )
+ *      depth = depth - what left the cell + what arrived
  *
- *  WHY IT LOOKS LIKE A FLUID AND NOT LIKE BLOCKS
+ *  with
+ *
+ *      potential = depth + how far down the gravity vector that cell sits
+ *
+ *  The potential is the whole trick, and it is why this behaves like a liquid
+ *  in *every* direction instead of only along the four grid axes:
+ *
+ *    - the depth difference is pressure, and it flattens the surface,
+ *    - the gravity term is a *continuous* function of the tilt, so at any angle
+ *      the liquid runs to the low side and the surface settles perpendicular to
+ *      g: a straight waterline at 17 degrees, a wave that rolls when you turn
+ *      the display over, all from the same two lines of code,
+ *    - the flow remembers what it did last step, which is the liquid's
+ *      momentum.  That is what makes it *slosh*: it overshoots the level, comes
+ *      back, and rings itself out - the thing a "give the mass to the
+ *      neighbour" model can never do, because diffusion has no inertia at all.
+ *
+ *  A speed limit on every flow, a "never pour out more than you hold" limiter
+ *  and a touch of surface tension keep that stable and keep the exact amount of
+ *  liquid in the tank: nothing is created, lost, or left inside the wall.
+ *
+ *  WHY IT LOOKS LIKE A LIQUID AND NOT LIKE BLOCKS
  *  ---------------------------------------------
- *  The simulation is on a grid, the *picture* is not.  For every line of the
- *  grid across the direction of gravity the sketch adds up the mass of that line
- *  and draws one solid run of pixels from the floor of the tank up to that
- *  height - so the visible surface is smooth to the pixel, while the physics
- *  stays a cheap cellular automaton.  Cells holding liquid above that surface
- *  (droplets thrown up by a shake) are drawn separately as small squares, which
- *  is where the spray comes from.
+ *  The simulation is a grid, the picture is not - and the renderer does not know
+ *  about gravity at all.  Per frame:
+ *
+ *    1. the depth of every cell (and of the empty border around the tank, which
+ *       is zero) becomes one byte per cell,
+ *    2. every pixel of the screen is a *bilinear* sample of that field, so a
+ *       12 pixel cell becomes a smoothly curving surface, and the waterline is
+ *       simply where the field crosses zero - a straight line at whatever angle
+ *       the display is held at,
+ *    3. the sample is turned into a colour by a 64 entry table which is built
+ *       once per frame: dark where the liquid is deep, bright where it is thin,
+ *       and hot along the very edge - which is what draws the meniscus along
+ *       the waterline and keeps a thin film visible instead of fading out in
+ *       steps.
+ *
+ *  Nothing is drawn as a rectangle and no cell is ever visible.  The only
+ *  geometry that is not the field is a droplet (see FLUID_DROPS): what a hard
+ *  shake throws out of the pool, drawn as a small filled circle.
  *
  *  THE ONE INPUT: the QMI8658 accelerometer
  *  ----------------------------------------
@@ -41,8 +69,8 @@
  *  hard shake throws it against the far wall instead of merely wobbling it.
  *
  *  Touch it:
- *      drag                push the liquid around (your finger is a local
- *                          gravity well, and it slowly paints new liquid)
+ *      drag                stir the liquid: the finger pushes it away from
+ *                          itself and slowly paints new liquid
  *      tap                 cycle the palette: constant colour / RGB by depth /
  *                          thermal
  *      hold for 0.7 s      cycle the four sensor -> display axis signs (see
@@ -56,23 +84,27 @@
  *  is the ceiling: roughly 55-60 fps.  At 40 MHz QSPI (see AMOLED_QSPI_CLOCK_HZ
  *  in AMOLED_Config.h) it is about 33 ms, i.e. roughly 30 fps.
  *
- *  Two things keep this sketch near that ceiling instead of far below it:
+ *  Three things keep this sketch near that ceiling instead of far below it:
  *
  *    1. streaming mode.  The scene is drawn into 32 line strips of internal DMA
  *       RAM and each strip is sent while the next one is drawn, so the pixels
  *       never leave the chip and no PSRAM is involved at all (this sketch does
  *       not need the 651 kB PSRAM framebuffer the other examples use).
- *    2. the fluid is drawn as a handful of rectangles per line, not as per pixel
- *       glow maths: filling 466 x 466 pixels costs about a millisecond, and the
- *       cellular automaton about the same.
+ *    2. the solver is a byte sized field of 40 x 40 cells plus two arrays of
+ *       flows - a few microseconds per step, so it can run several steps per
+ *       frame and still be invisible next to the bus.
+ *    3. the pixels are written straight into the strip buffer through
+ *       canvas.ptr() with a precomputed bilinear filter and a colour table:
+ *       217,000 pixels cost a couple of milliseconds and no drawing calls at
+ *       all.
  *
  *  The readout at the top of the screen (and the serial line once a second)
  *  prints where the time actually goes:
  *
  *      FPS   frames per second, measured over the last second
- *      PHY   cellular automaton, all substeps of the frame (ms)
- *      PLN   turning the grid into the rectangle list (ms)
- *      DRW   drawing the strips on the CPU (ms)
+ *      PHY   the solver: every step of the frame (ms)
+ *      FLD   turning the grid into the depth field and the colour table (ms)
+ *      DRW   writing the strips on the CPU (ms)
  *      DMA   the rest of the frame: the QSPI transfers, the part that overlaps
  *            the drawing, and waiting for a free strip buffer (ms)
  *      MB/s  W * H * 3 bytes / frame time - the achieved bus bandwidth.  This is
@@ -81,22 +113,22 @@
  *            means something else (a slower clone of the panel, USB serial
  *            traffic, an unstable clock) is in the way.
  *
- *  TUNING - the four knobs that change the look most
- *  ------------------------------------------------
+ *  TUNING - the knobs that change the look and the feel most
+ *  ---------------------------------------------------------
  *      FLUID_GRID_COLS  the resolution of the simulation.  40 cells across
- *                       means 12 px cells; 64 is a finer, more detailed liquid
- *                       (and 2.5x the simulation cost, which is still small);
- *                       24 is a coarse one, good for watching the grid work.
+ *                       means 12 px cells; 64 is a finer liquid (2.5x the
+ *                       solver cost, which is still small); 24 is coarse in the
+ *                       *physics* - the picture stays smooth either way.
  *      FLUID_FILL_PCT   how much liquid there is, in percent of the tank.  20
  *                       is a thin layer at the bottom, 60 sloshes against the
  *                       top of the round wall.  It can also be changed at
  *                       runtime (see the serial commands below).
- *      FLUID_FLOW_RATE  how fast the liquid moves (0.6 is water-ish, 0.25 is
- *                       thick like syrup, 1.0 is chaos)
- *      FLUID_GRAVITY_BIAS
- *                       how strongly the tilt beats the levelling term.  At 0
- *                       the liquid stays level even when you tilt; at 6 a slight
- *                       tilt sends it all to one side.
+ *      FLUID_FLOW       how fast the liquid answers a height difference - the
+ *                       speed of a wave in it.  0.15 is syrup, 0.5 is water,
+ *                       0.8 and up makes the surface ring.
+ *      FLUID_DAMP       the friction: 0.996 keeps it sloshing for seconds,
+ *                       0.95 dies in half a second, 0.999 rings for a long time.
+ *      FLUID_SHAKE_KICK how violently a shake throws the liquid around.
  *
  *  SERIAL COMMANDS (type them in the serial monitor, 115200 baud)
  *      +  /  -            5 % more / less liquid
@@ -151,10 +183,10 @@ static int W = 0, H = 0, CX = 0, CY = 0;
 /* ================================================================== */
 #define FLUID_FPS_CAP        60     /* 0 = no cap (see the tear seam note) */
 #define FLUID_SHOW_FPS       1
-#define FLUID_SHOW_PROFILE   1      /* PHY / PLN / DRW / DMA / MB/s readout */
+#define FLUID_SHOW_PROFILE   1      /* PHY / FLD / DRW / DMA / MB/s readout */
 #define FLUID_SHOW_HINT      1
 #define FLUID_SHOW_IMU       1
-#define FLUID_SHOW_RING      1      /* the line around the round tank      */
+#define FLUID_SHOW_RING      0     /* the line around the round tank      */
 #define FLUID_SHOW_GRID      0      /* 1 = show the simulation cells       */
 #define FLUID_SERIAL_FPS     1
 #define FLUID_SERIAL_CMDS    1      /* '+' '-' 'r' 'p' 's' in the monitor  */
@@ -162,56 +194,114 @@ static int W = 0, H = 0, CX = 0, CY = 0;
 /* ================================================================== */
 /*  2. The grid - the resolution of the simulation                     */
 /* ================================================================== */
-#define FLUID_GRID_COLS      40     /* cells across the screen (16 .. 72)  */
-#define FLUID_GRID_MAX       72     /* do not raise: the arrays are sized  */
-#define FLUID_FILL_PCT       45.0f  /* how much liquid, in % of the tank   */
-#define FLUID_FILL_FROM_TOP  0      /* 1 = fill from the top instead       */
+#define FLUID_GRID_COLS      20     /* cells across the screen (16 .. 72)  */
+#define FLUID_GRID_MAX       36     /* do not raise: the arrays are sized  */
+#define FLUID_FILL_PCT       60.0f  /* how much liquid, in % of the tank   */
+#define FLUID_FILL_FROM_TOP  1      /* 1 = fill from the top instead       */
 #define FLUID_TANK_ROUND     1      /* 1 = the visible disc, 0 = rectangle */
-#define FLUID_TANK_RADIUS    (AMOLED_SAFE_RADIUS - 2)
+#define FLUID_TANK_RADIUS    (AMOLED_SAFE_RADIUS-2)
 
 /* ================================================================== */
-/*  3. The physics of the cellular automaton                           */
+/*  3. The physics of the solver                                       */
 /* ================================================================== */
-/*  A cell gives f = (its own mass - the neighbour's mass) * rate away.          */
-/*  The rate of one direction is its weight divided by the sum of all four       */
-/*  weights, and the weights are: a constant levelling term (a liquid wants to   */
-/*  be flat) plus the gravity bias along that direction.                         */
-#define FLUID_LEVELING       0.22f  /* constant part of a direction's weight */
-#define FLUID_GRAVITY_BIAS   3.0f   /* how much tilt beats levelling         */
-#define FLUID_FLOW_RATE      0.60f  /* fraction of a height difference moved */
-#define FLUID_MAX_FLOW       0.30f  /* cells of liquid a cell may give away
-                                     * in one substep - this is the "viscosity"
-                                     * that keeps the surface from exploding   */
-#define FLUID_VISCOSITY      0.05f  /* extra smoothing of the surface         */
-#define FLUID_CELL_MAX       12.0f  /* safety clamp per cell                  */
-#define FLUID_CONNECT_MIN    0.35f  /* a cell this empty breaks the pool: what
-                                     * is beyond it is drawn as spray         */
-#define FLUID_PHYS_MS        16.6f  /* one substep represents this much time  */
-#define FLUID_MAX_SUBSTEPS   3      /* ... and a frame runs at most this many */
+/*  The classic "pipe model" of water in a sandbox: every cell holds a   */
+/*  depth, every edge between two cells holds a flow, and one step is    */
+/*                                                                    */
+/*    1. every flow is accelerated by the difference in potential across */
+/*       its edge and keeps a fraction of itself from the step before,   */
+/*    2. every cell then loses what leaves it and gains what arrives.   */
+/*                                                                    */
+/*  The potential is "depth + how far down the gravity vector that cell */
+/*  sits", and that is the whole trick: the depth part is pressure (it  */
+/*  flattens the surface) and the gravity part is a *continuous*        */
+/*  function of the tilt, so the liquid runs to the low side at any     */
+/*  angle and not only along the four grid axes.  The flow remembering  */
+/*  its previous value is the water's *momentum* - which is what makes  */
+/*  it slosh, overshoot and ring out; a plain "hand the mass to the     */
+/*  neighbours" rule can never do that, it only diffuses.               */
+/*                                                                    */
+/*  Everything is in pixels of liquid, so the numbers are easy to       */
+/*  reason about: one edge, one cell, and a fully tilted display puts   */
+/*  one cell of head into every edge.                                  */
+/* ================================================================== */
+#define FLUID_FLOW           0.50f  /* how fast a head difference turns into
+                                     * a flow - this is the speed of a wave
+                                     * in the liquid.  0.15 is thick like
+                                     * honey, 0.5 is water, above 0.8 the
+                                     * surface starts to ring badly.       */
+#define FLUID_DAMP           0.996f /* flow kept from one step to the next:
+                                     * 1.0 = no friction at all, 0.9 = the
+                                     * sloshing dies within a second       */
+#define FLUID_MAX_FLUX       0.60f  /* speed limit: one edge may not pass
+                                     * more than this fraction of a cell per
+                                     * step, whatever the head says       */
+#define FLUID_TENSION        0.030f /* surface tension - it rounds off the
+                                     * grid staircase and damps the grid
+                                     * scale ripples. 0 = off, 0.1 is
+                                     * noticeably thicker                 */
+#define FLUID_DEPTH_MAX      600.0f /* runaway net, in pixels of head - it
+                                     * has to sit above a *full* tank or it
+                                     * silently eats the liquid that arrives in
+                                     * the deepest cells and the pool never
+                                     * settles: a full 466 px tank is 466 px of
+                                     * head on the floor cell, so this is that
+                                     * plus room for a shake.  It is not a
+                                     * physics limit, nothing sane reaches it */
+#define FLUID_PHYS_MS        16.6f  /* one step is this much simulated time */
+#define FLUID_MAX_STEPS      3      /* ... and a frame runs at most this many */
 #define FLUID_GRAVITY        1.0f   /* 1 = the tilt as measured, 0 = ignore   */
 #define FLUID_SHAKE_DIR      0.85f  /* how much of a shake turns into "down"  */
 #define FLUID_SHAKE_BOOST    1.20f  /* extra pull while being shaken         */
-#define FLUID_SPLASH_MIN     0.25f  /* shake needed before anything flies    */
+#define FLUID_SHAKE_KICK     0.55f  /* a shake also throws the liquid up and
+                                     * sideways, in units of the maximum
+                                     * flow: 0 = a shake only tilts the tank */
+#define FLUID_SPLASH_MIN     0.22f  /* shake needed before anything flies    */
 
 /* ================================================================== */
 /*  4. The look                                                        */
 /* ================================================================== */
+/*  Every frame the sketch builds one 64 entry colour table out of the   */
+/*  depth of the liquid: entry 0 is the empty screen and the last entry  */
+/*  is the deepest liquid there is, so the table *is* the picture and    */
+/*  the pixel loop is a table lookup.                                    */
 #define FLUID_PALETTE        1      /* 0 constant colour, 1 RGB by depth,
                                      * 2 thermal - 'tap' cycles it too       */
 #define FLUID_R              0      /* used by palettes 0 and 2              */
 #define FLUID_G              170
 #define FLUID_B              255
-#define FLUID_SHADE_BANDS    2      /* vertical bands per line: 1 = flat
-                                     * (fastest), 2..6 = a depth gradient     */
-#define FLUID_SHADE_FLOOR    0.30f  /* brightness of the deepest band         */
-#define FLUID_DEPTH_FALLOFF  0.45f  /* how much a shallow line is dimmed      */
-#define FLUID_HUE_DEPTH      130.0f /* hue travel from the floor to the surface */
-#define FLUID_HUE_SPEED      10.0f  /* degrees per second of hue drift        */
-#define FLUID_SURFACE_GAIN   140    /* extra light on the top line, 0 = off   */
-#define FLUID_SURFACE_PX     2      /* thickness of that line, px             */
-#define FLUID_SPRAY_MIN      0.06f  /* mass below this is not drawn at all    */
-#define FLUID_BG             0x000000u
-#define FLUID_MAX_RECTS      900    /* the rectangle list per frame           */
+#define FLUID_SHADE_FLOOR    0.32f  /* brightness of the deepest liquid:
+                                     * below that a pool stops reading as
+                                     * one body                            */
+#define FLUID_DEPTH_FULL     120.0f /* depth, in pixels, that counts as "as
+                                     * deep as it gets".  The shading follows
+                                     * the deepest cell in the tank until it
+                                     * reaches this, so a shallow puddle still
+                                     * uses the whole table                 */
+#define FLUID_RIM            0.18f  /* where the meniscus highlight sits, as
+                                     * a fraction of the table - it is what
+                                     * draws the bright line along the water-
+                                     * line and the edge of a thin film    */
+#define FLUID_RIM_GAIN       190    /* how much white is added there, 0 = off */
+#define FLUID_EDGE_AA        3      /* how many table entries the surface
+                                     * fades in over: 0 = a hard pixel edge,
+                                     * 4 = a soft one                      */
+#define FLUID_HUE_DEPTH      130.0f /* how far the hue travels between a
+                                     * shallow and a deep cell, in degrees  */
+#define FLUID_HUE_SPEED      10.0f  /* degrees per second of hue drift     */
+#define FLUID_LUT_SHIFT      2      /* the table has 256 >> this entries   */
+#define FLUID_BG             0x000000u /* what the empty screen is         */
+
+/* ---- droplets: what a hard shake throws out of the pool ------------ */
+#define FLUID_DROPS          1      /* 1 = a real shake really sprays      */
+#define FLUID_DROP_MAX       48     /* never more than this many at once   */
+#define FLUID_DROP_RATE      0.75f  /* droplets per frame and unit of shake */
+#define FLUID_DROP_MASS      14.0f  /* liquid per droplet, in pixels of depth */
+#define FLUID_DROP_MIN       6.0f   /* a cell needs at least this much liquid
+                                     * before it may give a droplet away   */
+#define FLUID_DROP_LIFE      4.0f   /* seconds before a stranded one gives up */
+#define FLUID_DROP_LAUNCH    170.0f /* px/s of "up" a new droplet starts with */
+#define FLUID_DROP_SPREAD    110.0f /* px/s of randomness on top of that   */
+#define FLUID_DROP_G         900.0f /* px/s^2 of acceleration, at 1 g      */
 
 /* ================================================================== */
 /*  5. Touch                                                           */
@@ -219,7 +309,10 @@ static int W = 0, H = 0, CX = 0, CY = 0;
 #define FLUID_TOUCH_ENABLE   1
 #define FLUID_TOUCH_R        70     /* how far the finger's "gravity" reaches  */
 #define FLUID_TOUCH_PUSH     3.0f   /* how hard it pushes away from the finger */
-#define FLUID_TOUCH_PAINT    0.20f  /* liquid painted per second, 0 = no paint */
+#define FLUID_TOUCH_PAINT    30.0f  /* pixels of depth painted per second, with
+                                     * the finger as the tap: the same knob as
+                                     * FLUID_FILL_PCT, live.  0 = the finger
+                                     * only ever pushes, never adds          */
 
 /* ================================================================== */
 /*  6. IMU (QMI8658 accelerometer)                                     */
@@ -232,52 +325,58 @@ static int W = 0, H = 0, CX = 0, CY = 0;
 #define IMU_TEXT_MS          250    /* readout refresh, ms                  */
 
 /* ================================================================== */
-/*  7. The grid itself, and the frame's rectangle list                 */
+/*  7. The grid, the field, the colour table and the frame state       */
 /*                                                                    */
-/*  gridMass/gridDelta are padded by one cell on every side, so the    */
-/*  neighbour lookups in the hot loop never need a bounds test: a      */
-/*  border cell simply counts as "outside" and is never written.       */
+/*  Every grid array is padded by one cell on each side, so the         */
+/*  neighbour lookups in the hot loops never need a bounds test: a       */
+/*  border cell is simply never "inside", and every flow that tries to   */
+/*  cross it stays zero - which is exactly what a glass wall does.       */
+/*                                                                    */
+/*      gridDepth   the liquid column above the cell, in pixels         */
+/*      gridFluxX   the flow through the cell's LEFT edge, + = right    */
+/*      gridFluxY   the flow through the cell's TOP  edge, + = down     */
+/*      gridInside  1 = the cell is inside the tank                     */
+/*      gridField   the depth as one byte - what the renderer samples   */
 /* ================================================================== */
 #define GRID_STRIDE      (FLUID_GRID_MAX + 2)
 #define GRID_CELLS       (GRID_STRIDE * GRID_STRIDE)
 
-static float    gridMass[GRID_CELLS];     /* cells of liquid (1.0 = full)  */
-static float    gridDelta[GRID_CELLS];    /* one substep of net flow       */
-static uint8_t  gridInside[GRID_CELLS];   /* 1 = this cell is in the tank  */
+static float    gridDepth[GRID_CELLS];    /* liquid in the cell, in pixels */
+static float    gridFluxX[GRID_CELLS];    /* left edge, + = to the right  */
+static float    gridFluxY[GRID_CELLS];    /* top  edge, + = downwards     */
+static uint8_t  gridField[GRID_CELLS];    /* depth as 0..255              */
+static uint8_t  gridInside[GRID_CELLS];   /* 1 = this cell is in the tank */
 
-/* cell (x, y) in the padded array; only x/y in 0..gridCols-1 / 0..gridRows-1 are
- * ever written, everything outside stays 0 = outside the tank */
+/* cell (x, y) in the padded array; only x/y in 0..gridCols-1 / 0..gridRows-1
+ * are ever used, everything outside stays 0 = outside the tank */
 static inline int gidx(int x, int y) { return (y + 1) * GRID_STRIDE + (x + 1); }
 
 static int      gridCols = 0, gridRows = 0, cellPx = 0;
 
-/* where the tank is, per line of the grid: the first and last cell that is
- * inside, and the same as a pixel span - both directions are needed because the
- * sweep runs along the gravity axis (a display lying on its side pools against
- * the left or right wall) */
-static int16_t  lineTop[FLUID_GRID_MAX],   lineBot[FLUID_GRID_MAX];
-static int16_t  lineLeft[FLUID_GRID_MAX],  lineRight[FLUID_GRID_MAX];
-static int16_t  colY0[FLUID_GRID_MAX],     colY1[FLUID_GRID_MAX];
-static int16_t  rowX0[FLUID_GRID_MAX],     rowX1[FLUID_GRID_MAX];
+/* Where a pixel of the screen samples the field: the cell to its left/top and
+ * the 0..255 position between that cell's centre and the next.  That is the
+ * whole bilinear filter, precomputed once per grid build so that the inner loop
+ * of the renderer is one multiply and one shift per pixel. */
+static uint8_t  pxCellX[AMOLED_WIDTH],  pxFracX[AMOLED_WIDTH];
+static uint8_t  pxCellY[AMOLED_HEIGHT], pxFracY[AMOLED_HEIGHT];
 
-static float    lineHeight[FLUID_GRID_MAX];    /* contiguous liquid, in cells */
-static float    lineHeightMax = 1.0f;          /* the deepest line this frame */
+/* The colour table: entry 0 is the empty screen, the last entry is the deepest
+ * liquid there is.  It is rebuilt once per frame (fluidBuildLut), which is why
+ * a shallow puddle still gets the full range of shades and nothing jumps. */
+#define FLUID_LUT_N     (256 >> FLUID_LUT_SHIFT)
+static uint8_t  lutR[FLUID_LUT_N], lutG[FLUID_LUT_N], lutB[FLUID_LUT_N];
 
+/* A droplet a shake threw out of the pool - see section 12b. */
+struct FluidDrop { float x, y, vx, vy, mass, life; };
+static FluidDrop drops[FLUID_DROP_MAX];
+static int       dropCount = 0;
+static int       dropLive  = 0;           /* for the readout                */
+
+static float    fieldRef     = 90.0f;     /* depth that "deep" means        */
 static float    fluidFillPct = FLUID_FILL_PCT;
-static float    fluidMass    = 0.0f;           /* total, for the readout     */
-
-/* One rectangle of the frame.  "add" ones are drawn additively (light on top of
- * what is there), which is how the meniscus line on the surface is made. */
-struct FluidRect
-{
-    int16_t  x0, y0, x1, y1;
-    uint32_t c;
-    uint8_t  add;
-};
-
-static FluidRect rects[FLUID_MAX_RECTS];
-static int       rectCount = 0;
-static int       rectDropped = 0;
+static float    fluidMass    = 0.0f;      /* total liquid, px of head       */
+static float    fluidWetPct  = 0.0f;      /* how much of the glass it covers */
+static float    fluidSpeed   = 0.0f;      /* mean flow, px per step         */
 
 /* ================================================================== */
 /*  8. Frame state, timing and the readouts                            */
@@ -295,7 +394,7 @@ static int      touchX = 0, touchY = 0;
 
 static uint32_t fpsFrames = 0, fpsStartMs = 0, lastFrameMs = 0;
 static float    fps = 0.0f;
-static float    msPhys = 0.0f, msPlan = 0.0f, msDraw = 0.0f, msDma = 0.0f,
+static float    msPhys = 0.0f, msField = 0.0f, msDraw = 0.0f, msDma = 0.0f,
                 msFrame = 0.0f, mbPerSec = 0.0f;
 
 static char     fpsLine[32]     = "";
@@ -317,41 +416,66 @@ static inline float clampf(float v, float lo, float hi)
 /* -1 .. +1, from the Arduino PRNG */
 static inline float frand(void) { return (float)random(-1000, 1001) * 0.001f; }
 
-/* colour for one band of the liquid in one line.
- *   t    0 = the floor of this line, 1 = its surface
- *   rel  this line's height compared to the deepest line (0..1) */
-static uint32_t fluidColour(float t, float rel, bool surface)
+/* The colour table for this frame: FLUID_LUT_N entries from "nothing at all" to
+ * "as deep as this tank gets".  The last few steps towards zero are the
+ * meniscus - the bright edge along the waterline - and they are what keeps a
+ * thin film and a receding shoreline visible instead of letting them pop out of
+ * existence the moment the depth drops below one cell. */
+static void fluidBuildLut(void)
 {
-    const float depth = FLUID_SHADE_FLOOR + (1.0f - FLUID_SHADE_FLOOR) * t;
-    const float dim   = 1.0f - FLUID_DEPTH_FALLOFF * (1.0f - rel);
-    float       v     = clampf(depth * dim, 0.0f, 1.0f);
-
-    if (surface && FLUID_SURFACE_GAIN)
+    for (int k = 0; k < FLUID_LUT_N; k++)
     {
-        v = clampf(v * (1.0f + (float)FLUID_SURFACE_GAIN / 255.0f), 0.0f, 1.0f);
-    }
-
-    switch (paletteMode)
-    {
-        case 0:     /* one constant colour, only its brightness follows depth */
-            return amoledScale(amoledRGB(FLUID_R, FLUID_G, FLUID_B),
-                               (uint16_t)(v * 255.0f), 255);
-
-        case 2:     /* thermal: the same base colour, but the surface and the
-                     * spray go white hot */
+        if (k == 0)                        /* entry 0 = the empty screen */
         {
-            const uint32_t base = amoledScale(amoledRGB(FLUID_R, FLUID_G, FLUID_B),
-                                              (uint16_t)(v * 255.0f), 255);
-            const uint8_t  k    = (uint8_t)(clampf(t * t, 0.0f, 1.0f) * (surface ? 230.0f : 150.0f));
-            return amoledMix(base, AMOLED_WHITE, k);
+            lutR[0] = (uint8_t)amoledR(FLUID_BG);
+            lutG[0] = (uint8_t)amoledG(FLUID_BG);
+            lutB[0] = (uint8_t)amoledB(FLUID_BG);
+            continue;
         }
 
-        default:    /* RGB: hue runs from the colour of the deep liquid to the
-                     * colour at the surface, and drifts slowly with time */
+        const float v     = (float)k / (float)(FLUID_LUT_N - 1);   /* 0 thin .. 1 deep */
+        const float shade = 1.0f - (1.0f - FLUID_SHADE_FLOOR) * v;
+        uint32_t    c;
+
+        switch (paletteMode)
         {
-            const float hue = hueBase + FLUID_HUE_DEPTH * t;
-            return amoledHSV(hue, 1.0f, clampf(0.22f + 0.78f * v, 0.0f, 1.0f));
+            case 0:   /* one constant colour, its brightness follows the depth */
+                c = amoledScale(amoledRGB(FLUID_R, FLUID_G, FLUID_B),
+                                (uint16_t)(shade * 255.0f), 255);
+                break;
+
+            case 2:   /* thermal: the same base colour, white hot at the edge */
+            {
+                const uint32_t base = amoledScale(amoledRGB(FLUID_R, FLUID_G, FLUID_B),
+                                                  (uint16_t)(shade * 255.0f), 255);
+                const uint8_t  hot  = (uint8_t)(clampf((1.0f - v) * (1.0f - v), 0.0f, 1.0f) * 150.0f);
+                c = amoledMix(base, AMOLED_WHITE, hot);
+                break;
+            }
+
+            default:  /* RGB: the hue runs from the deep liquid to the thin edge
+                       * of the water and drifts slowly with time */
+                c = amoledHSV(hueBase + FLUID_HUE_DEPTH * (1.0f - v), 1.0f,
+                              clampf(0.22f + 0.78f * shade, 0.0f, 1.0f));
+                break;
         }
+
+        if (FLUID_RIM_GAIN > 0 && FLUID_RIM > 0.0f && v < FLUID_RIM)
+        {
+            const float rim = 1.0f - v / FLUID_RIM;
+            c = amoledMix(c, AMOLED_WHITE, (uint8_t)(rim * (float)FLUID_RIM_GAIN));
+        }
+
+        if (FLUID_EDGE_AA > 0)             /* fade the first entries in, so the
+                                            * surface has no hard pixel edge */
+        {
+            const float aa = clampf((float)k / (float)FLUID_EDGE_AA, 0.0f, 1.0f);
+            if (aa < 1.0f) c = amoledScale(c, (uint16_t)(aa * 255.0f), 255);
+        }
+
+        lutR[k] = (uint8_t)amoledR(c);
+        lutG[k] = (uint8_t)amoledG(c);
+        lutB[k] = (uint8_t)amoledB(c);
     }
 }
 
@@ -603,321 +727,447 @@ static void fluidGravityUpdate(float dt)
 
 /* ================================================================== */
 /* 11. Building the tank, and filling it                               */
-/*                                                                    */
-/*  Cell size is chosen so the grid covers the screen: 466 px / 40     */
-/*  columns = 12 px cells (rounded up), and 40 rows of 12 px is 480 px */
-/*  so the last row hangs over the bottom edge by 14 px - harmless,    */
-/*  the canvas clips and the round tank ends before that anyway.       */
 /* ================================================================== */
+/* One axis of the pixel -> cell map.  A pixel samples between the centres of
+ * two cells: p samples the cell at (p + 0.5) / cellPx - 0.5 cell units, split
+ * into the cell index and a 0..255 fraction.  Outside the grid the index is
+ * clamped onto the empty border cell, which is what makes the edge of the tank
+ * a smooth fade to the background instead of a hard cut. */
+static void fluidBuildPxMap(int p, int cell, int cells, uint8_t *idx, uint8_t *frac)
+{
+    const int v256 = ((2 * p + 1) * 128) / cell - 128;     /* in 1/256 cells */
+    int c, f;
+
+    if (v256 <= 0) { c = 0; f = 0; }
+    else
+    {
+        c = v256 >> 8;
+        f = v256 & 0xFF;
+        if (c >= cells) { c = cells - 1; f = 255; }
+    }
+    idx[p]  = (uint8_t)c;
+    frac[p] = (uint8_t)f;
+}
+
 static void fluidGridBuild(void)
 {
     gridCols = FLUID_GRID_COLS;
-    if (gridCols < 16) gridCols = 16;
-    if (gridCols > FLUID_GRID_MAX) gridCols = FLUID_GRID_MAX;
-
-    cellPx = (W + gridCols - 1) / gridCols;
-    if (cellPx < 2) cellPx = 2;
-
+    if (gridCols < 4)               gridCols = 4;
+    if (gridCols > FLUID_GRID_MAX)  gridCols = FLUID_GRID_MAX;
+    cellPx   = (W + gridCols - 1) / gridCols;
     gridRows = (H + cellPx - 1) / cellPx;
-    if (gridRows > FLUID_GRID_MAX) gridRows = FLUID_GRID_MAX;
 
-    memset(gridMass,   0, sizeof(gridMass));
     memset(gridInside, 0, sizeof(gridInside));
+    memset(gridDepth,  0, sizeof(gridDepth));
+    memset(gridFluxX,  0, sizeof(gridFluxX));
+    memset(gridFluxY,  0, sizeof(gridFluxY));
+    memset(gridField,  0, sizeof(gridField));
 
-    const float rad  = (float)FLUID_TANK_RADIUS;
-    const float rad2 = rad * rad;
-
-    /* ---- which cells hold liquid at all ---------------- */
+    /* which cells hold liquid at all - the round glass, in other words */
     for (int y = 0; y < gridRows; y++)
-    {
-        for (int x = 0; x < gridCols; x++)
-        {
-            const float px = (float)(x * cellPx) + cellPx * 0.5f - (float)CX;
-            const float py = (float)(y * cellPx) + cellPx * 0.5f - (float)CY;
-#if FLUID_TANK_ROUND
-            const bool in = (px * px + py * py) <= rad2;
-#else
-            const bool in = (px >= -rad && px <= rad && py >= -rad && py <= rad);
-#endif
-            if (in) gridInside[gidx(x, y)] = 1;
-        }
-    }
-
-    /* ---- the tank, as seen from both sweep directions --- */
     for (int x = 0; x < gridCols; x++)
     {
-        int top = gridRows, bot = -1;
-        for (int y = 0; y < gridRows; y++)
-        {
-            if (!gridInside[gidx(x, y)]) continue;
-            if (y < top) top = y;
-            if (y > bot) bot = y;
-        }
-        lineTop[x] = (int16_t)top;
-        lineBot[x] = (int16_t)bot;
-        if (bot >= 0)
-        {
-            colY0[x] = (int16_t)(top * cellPx);
-            const int y1 = bot * cellPx + cellPx - 1;
-            colY1[x] = (int16_t)(y1 < H - 1 ? y1 : H - 1);
-        }
-        else { colY0[x] = 0; colY1[x] = -1; }
+        const float cx = ((float)x + 0.5f) * (float)cellPx - 0.5f;
+        const float cy = ((float)y + 0.5f) * (float)cellPx - 0.5f;
+        bool inside = (cx >= 0.0f && cy >= 0.0f &&
+                       cx <= (float)(W - 1) && cy <= (float)(H - 1));
+#if FLUID_TANK_ROUND
+        const float dx = cx - (float)CX, dy = cy - (float)CY;
+        const float r  = (float)FLUID_TANK_RADIUS;
+        if (inside && dx * dx + dy * dy > r * r) inside = false;
+#endif
+        if (inside) gridInside[gidx(x, y)] = 1;
     }
 
-    for (int y = 0; y < gridRows; y++)
-    {
-        int left = gridCols, right = -1;
-        for (int x = 0; x < gridCols; x++)
-        {
-            if (!gridInside[gidx(x, y)]) continue;
-            if (x < left)  left  = x;
-            if (x > right) right = x;
-        }
-        lineLeft[y]  = (int16_t)left;
-        lineRight[y] = (int16_t)right;
-        if (right >= 0)
-        {
-            rowX0[y] = (int16_t)(left * cellPx);
-            const int x1 = right * cellPx + cellPx - 1;
-            rowX1[y] = (int16_t)(x1 < W - 1 ? x1 : W - 1);
-        }
-        else { rowX0[y] = 0; rowX1[y] = -1; }
-    }
+    for (int x = 0; x < W; x++) fluidBuildPxMap(x, cellPx, gridCols, pxCellX, pxFracX);
+    for (int y = 0; y < H; y++) fluidBuildPxMap(y, cellPx, gridRows, pxCellY, pxFracY);
 }
 
-/* How many cells the tank has - the unit the fill percentage is measured in. */
 static int fluidTankCells(void)
 {
     int n = 0;
-    for (int y = 0; y < gridRows; y++)
-        for (int x = 0; x < gridCols; x++)
-            if (gridInside[gidx(x, y)]) n++;
+    for (int i = 0; i < GRID_CELLS; i++) if (gridInside[i]) n++;
     return n;
 }
 
-/* Pour the liquid in.  Whole rows from the bottom, spread evenly along the row,
- * so that a fill below one cell per row is a thin film and not a stripe. */
+/* Fill the tank with `pct` percent of its volume - a slab of liquid standing on
+ * the floor and `h` pixels tall, so the number means the same thing as
+ * FLUID_FILL_PCT and the waterline lands where the top of the slab would be.
+ * The depth is a head, so the slab is written as the height of the liquid
+ * column above each cell: 0 at the surface, `h` down at the floor.  That is the
+ * shape the solver rests in, which is why a fresh tank starts out still. */
 static void fluidReset(float pct)
 {
+    memset(gridDepth, 0, sizeof(gridDepth));
+    memset(gridFluxX, 0, sizeof(gridFluxX));
+    memset(gridFluxY, 0, sizeof(gridFluxY));
+    memset(gridField, 0, sizeof(gridField));
+    dropCount = 0;
+    dropLive  = 0;
+
     fluidFillPct = clampf(pct, 0.0f, 100.0f);
-    memset(gridMass, 0, sizeof(gridMass));
 
-    const int tank = fluidTankCells();
-    float target = (float)tank * fluidFillPct / 100.0f;
+    const float h = fluidFillPct * 0.01f * (float)H;
 
-    for (int r = 0; r < gridRows && target > 0.0f; r++)
-    {
-        const int y = FLUID_FILL_FROM_TOP ? r : (gridRows - 1 - r);
-
-        int n = 0;
-        for (int x = 0; x < gridCols; x++) if (gridInside[gidx(x, y)]) n++;
-        if (n == 0) continue;
-
-        const float take = (target >= (float)n) ? (float)n : target;
-        const float per  = take / (float)n;
-        for (int x = 0; x < gridCols; x++)
-        {
-            const int i = gidx(x, y);
-            if (gridInside[i]) gridMass[i] = per;
-        }
-        target -= take;
-    }
-
-    fluidMass = (float)tank * fluidFillPct / 100.0f;
-}
-
-/* Total liquid in the tank, in cells - for the readout. */
-static float fluidMassTotal(void)
-{
-    double sum = 0.0;
     for (int y = 0; y < gridRows; y++)
-        for (int x = 0; x < gridCols; x++)
-        {
-            const int i = gidx(x, y);
-            if (gridInside[i]) sum += gridMass[i];
-        }
-    return (float)sum;
-}
-
-/* ================================================================== */
-/* 12. The simulation: one substep of the cellular automaton           */
-/*                                                                    */
-/*  Every cell with liquid in it gives some of it to each of its four  */
-/*  neighbours:                                                        */
-/*                                                                    */
-/*      flow = (my mass - the neighbour's mass) * weight * rate        */
-/*                                                                    */
-/*  and the weight of a direction is the levelling term (a liquid      */
-/*  wants to be flat, and that is what makes it flow uphill sideways   */
-/*  into a hollow) plus the gravity bias along that direction.         */
-/*                                                                    */
-/*  Only *downhill* differences are transported, a cell never hands    */
-/*  out more than it holds, and every flow is applied as one           */
-/*  subtraction plus one addition of the same number - so the total    */
-/*  amount of liquid is conserved exactly, whatever order the sweep    */
-/*  runs in.  There is no matrix to solve and no velocity field: the   */
-/*  height difference *is* the pressure, which is why a few thousand   */
-/*  cells per frame is all this costs.                                 */
-/* ================================================================== */
-static const int8_t kDirDX[4] = { +1, -1,  0,  0 };   /* right, left, down, up */
-static const int8_t kDirDY[4] = {  0,  0, +1, -1 };
-
-/* add the accumulated flows to the mass field */
-static void fluidApplyDelta(void)
-{
-    for (int y = 0; y < gridRows; y++)
+    for (int x = 0; x < gridCols; x++)
     {
-        for (int x = 0; x < gridCols; x++)
-        {
-            const int i = gidx(x, y);
-            if (!gridInside[i]) continue;
+        const int i = gidx(x, y);
+        if (!gridInside[i]) continue;
 
-            float v = gridMass[i] + gridDelta[i];
-            if (v < 0.0f)           v = 0.0f;
-            if (v > FLUID_CELL_MAX) v = FLUID_CELL_MAX;
-            gridMass[i] = v;
-        }
+        /* a slab of liquid h pixels tall, standing on the floor of the tank
+         * (FLUID_FILL_FROM_TOP: hanging from its ceiling instead).
+         *
+         * gridDepth is a head, not a thickness: the solver only sits still when
+         * the depth grows by one cell per row downwards, because that is what
+         * cancels the gravity term across an edge - so the number in a cell is
+         * the height of the liquid column above it.  The surface of a slab h
+         * tall standing on the floor is therefore at y = H - h, and the depth
+         * runs from 0 there to h down at the floor, which is also what makes
+         * FLUID_FILL_PCT mean "the waterline is (100 - pct) % down the tank".
+         * Filling from the ceiling is the same slab the other way up. */
+        const float cy = ((float)y + 0.5f) * (float)cellPx - 0.5f;
+        const float d  = FLUID_FILL_FROM_TOP ? cy : (cy - ((float)H - h));
+
+        gridDepth[i] = clampf(d, 0.0f, h);
     }
 }
 
-static void fluidStep(float ux, float uy, float mag)
+/* How much liquid there is, and how much of the glass it covers - the second
+ * number is the one that reads like a fill level.  gridDepth is a head, not a
+ * thickness: the solver only rests when the depth grows by a cell per row
+ * downwards, so the value in a cell is the height of the liquid column above
+ * it, and the sum of those is not a volume.  Counting the cells that actually
+ * hold liquid (which is the area under the waterline, so it matches
+ * FLUID_FILL_PCT on a still, upright tank) is honest and costs one comparison
+ * in the loop that was there anyway. */
+static float fluidMeasure(float *wetPct)
 {
-    /* how hard gravity pulls, compared with the levelling term */
-    const float gb = FLUID_GRAVITY_BIAS * 0.5f * clampf(mag, 0.0f, 2.5f);
+    float s   = 0.0f;
+    int   wet = 0, live = 0;
 
-    float w[4];
-    w[0] = FLUID_LEVELING + gb * (ux > 0.0f ?  ux : 0.0f);   /* right */
-    w[1] = FLUID_LEVELING + gb * (ux < 0.0f ? -ux : 0.0f);   /* left  */
-    w[2] = FLUID_LEVELING + gb * (uy > 0.0f ?  uy : 0.0f);   /* down  */
-    w[3] = FLUID_LEVELING + gb * (uy < 0.0f ? -uy : 0.0f);   /* up    */
-
-    /* Steepest direction first: if a cell runs out of liquid while it is handing
-     * something out, it is the direction gravity favours that gets it. */
-    int ord[4] = { 0, 1, 2, 3 };
-    for (int a = 0; a < 3; a++)
+    for (int i = 0; i < GRID_CELLS; i++)
     {
-        for (int b = a + 1; b < 4; b++)
+        if (!gridInside[i]) continue;
+        live++;
+        s += gridDepth[i];
+        if (gridDepth[i] > 0.01f) wet++;
+    }
+
+    if (wetPct) *wetPct = live ? 100.0f * (float)wet / (float)live : 0.0f;
+    return s;
+}
+
+/* ================================================================== */
+/* 12. The simulation: one step of the solver                          */
+/* ================================================================== */
+/*  Two passes, and between them they are the whole physics:           */
+/*                                                                    */
+/*    1. FLUX.  Every edge looks at the head across it - the difference */
+/*       in depth, plus the difference in how far down the gravity      */
+/*       vector the two cells sit - and accelerates its flow by that,   */
+/*       keeping FLUID_DAMP of what it had.  That memory is the water's */
+/*       inertia: without it the liquid can only diffuse, with it, it   */
+/*       sloshes.                                                       */
+/*    2. FLOW.  Every cell adds up what enters and what leaves over its */
+/*       four edges, limiting the outgoing flows so that no cell can    */
+/*       pour out more than it holds - which is what lets a nearly     */
+/*       empty cell coast instead of going negative.                    */
+/*                                                                    */
+/*  The gravity term is where the tilt enters, and it is continuous: at */
+/*  17 degrees the head across one cell is gx * cellPx, so the surface  */
+/*  settles perpendicular to g - at any angle, not only along the axes. */
+/*                                                                    */
+/*  One step is FLUID_PHYS_MS of simulated time whatever the frame rate */
+/*  is, so the liquid moves at the same speed at 20 and at 60 fps.      */
+/* ================================================================== */
+static void fluidStep(float gx, float gy, float kick)
+{
+    const float headX = gx * (float)cellPx;      /* head across one cell, px */
+    const float headY = gy * (float)cellPx;
+    const float fmax  = FLUID_MAX_FLUX * (float)cellPx;
+
+    /* ---- pass 1: accelerate every flow ---------------------------- */
+    for (int y = 0; y < gridRows; y++)
+    for (int x = 0; x < gridCols; x++)
+    {
+        const int i = gidx(x, y);
+        if (!gridInside[i]) continue;
+
+        /* the left edge: the flow from the cell on the left into this one */
+        if (gridInside[i - 1])
         {
-            if (w[ord[b]] > w[ord[a]])
+            const float f = gridFluxX[i] * FLUID_DAMP +
+                            FLUID_FLOW * ((gridDepth[i - 1] - gridDepth[i]) + headX);
+            gridFluxX[i] = clampf(f, -fmax, fmax);
+        }
+        else gridFluxX[i] = 0.0f;                /* the glass wall */
+
+        /* the top edge: the flow from the cell above into this one */
+        if (gridInside[i - GRID_STRIDE])
+        {
+            const float f = gridFluxY[i] * FLUID_DAMP +
+                            FLUID_FLOW * ((gridDepth[i - GRID_STRIDE] - gridDepth[i]) + headY);
+            gridFluxY[i] = clampf(f, -fmax, fmax);
+        }
+        else gridFluxY[i] = 0.0f;
+
+        /* ---- a shake throws the liquid around --------------------- */
+        if (FLUID_SHAKE_KICK > 0.0f && kick > 0.0f)
+        {
+            gridFluxX[i] = clampf(gridFluxX[i] + frand() * kick, -fmax, fmax);
+            gridFluxY[i] = clampf(gridFluxY[i] + (frand() * 0.5f - 0.9f) * kick, -fmax, fmax);
+        }
+
+        /* ---- the finger stirs it --------------------------------- */
+#if FLUID_TOUCH_ENABLE
+        if (touchOn && FLUID_TOUCH_PUSH > 0.0f)
+        {
+            const float cx = ((float)x + 0.5f) * (float)cellPx;
+            const float cy = ((float)y + 0.5f) * (float)cellPx;
+            const float dx = cx - (float)touchX, dy = cy - (float)touchY;
+            const float d2 = dx * dx + dy * dy;
+            const float r  = (float)FLUID_TOUCH_R;
+
+            if (d2 < r * r)
             {
-                const int t = ord[a]; ord[a] = ord[b]; ord[b] = t;
+                const float d   = sqrtf(d2) + 1.0f;
+                const float amp = FLUID_TOUCH_PUSH * (1.0f - d / r) * fmax * 0.5f;
+                gridFluxX[i] = clampf(gridFluxX[i] + amp * dx / d, -fmax, fmax);
+                gridFluxY[i] = clampf(gridFluxY[i] + amp * dy / d, -fmax, fmax);
+            }
+        }
+#endif
+    }
+
+    /* ---- pass 2: move the liquid ---------------------------------- */
+    float speedSum = 0.0f;
+    int   speedN   = 0;
+
+    for (int y = 0; y < gridRows; y++)
+    for (int x = 0; x < gridCols; x++)
+    {
+        const int i = gidx(x, y);
+        if (!gridInside[i]) continue;
+
+        float inX  = gridFluxX[i];                   /* from the left  */
+        float outX = gridFluxX[i + 1];               /* to the right   */
+        float inY  = gridFluxY[i];                   /* from above     */
+        float outY = gridFluxY[i + GRID_STRIDE];     /* to below       */
+
+        /* never pour out more than the cell actually holds */
+        float out = 0.0f;
+        if (outX > 0.0f) out += outX;
+        if (outY > 0.0f) out += outY;
+        if (inX  < 0.0f) out -= inX;
+        if (inY  < 0.0f) out -= inY;
+
+        const float d = gridDepth[i];
+
+        if (out > d && out > 1e-6f)
+        {
+            const float k = d / out;                 /* the whole cell coasts now */
+            if (outX > 0.0f) { outX *= k; gridFluxX[i + 1]           = outX; }
+            if (outY > 0.0f) { outY *= k; gridFluxY[i + GRID_STRIDE] = outY; }
+            if (inX  < 0.0f) { inX  *= k; gridFluxX[i]               = inX;  }
+            if (inY  < 0.0f) { inY  *= k; gridFluxY[i]               = inY;  }
+        }
+
+        gridDepth[i] = d + (inX - outX) + (inY - outY);
+        gridDepth[i] = clampf(gridDepth[i], 0.0f, FLUID_DEPTH_MAX);
+
+        /* how fast the liquid moves, for the readout: if this is zero the tank
+         * is at rest, whatever the picture happens to look like */
+        speedSum += fabsf(inX) + fabsf(outX) + fabsf(inY) + fabsf(outY);
+        speedN++;
+    }
+
+    if (speedN > 0) fluidSpeed = speedSum / (float)(speedN * 4);
+}
+
+/* Surface tension, done as a plain exchange between neighbours: a little liquid
+ * moves from the fuller cell to the emptier one.  One multiply per edge, exactly
+ * conservative, and it is what rounds off the grid staircase and damps the cell
+ * sized ripples - the difference between a surface that reads as water and one
+ * that reads as a chessboard with waves on it. */
+static void fluidTension(void)
+{
+    if (FLUID_TENSION <= 0.0f) return;       /* the switch is off */
+    for (int y = 0; y < gridRows; y++)
+    for (int x = 0; x < gridCols; x++)
+    {
+        const int i = gidx(x, y);
+        if (!gridInside[i]) continue;
+
+        for (int k = 0; k < 2; k++)              /* right, then below */
+        {
+            const int n = k ? (i + GRID_STRIDE) : (i + 1);
+            if (!gridInside[n]) continue;
+
+            float f = (gridDepth[i] - gridDepth[n]) * FLUID_TENSION * 0.25f;
+            if (f > 0.0f)
+            {
+                if (f > gridDepth[i]) f = gridDepth[i];   /* never go negative */
+                gridDepth[i] -= f;
+                gridDepth[n] += f;
+            }
+            else if (f < 0.0f)
+            {
+                if (-f > gridDepth[n]) f = -gridDepth[n];
+                gridDepth[i] -= f;
+                gridDepth[n] += f;
             }
         }
     }
+}
 
-    const float kBase = FLUID_FLOW_RATE / (w[0] + w[1] + w[2] + w[3]);
+/* ================================================================== */
+/* 12c. Droplets - what a hard shake throws out of the pool            */
+/*                                                                    */
+/*  A droplet is a little liquid that leaves the grid for a moment: it  */
+/*  takes its mass out of the cell it starts in, flies as a ballistic   */
+/*  body under the *same* gravity the tank feels, bounces off the glass */
+/*  and gives the mass back to whatever cell it lands in.  The total    */
+/*  amount of liquid therefore never changes - it is only in the air    */
+/*  for a moment, which is exactly what a splash is.                    */
+/* ================================================================== */
+static void fluidDropAdd(int cell, float mass)
+{
+    gridDepth[cell] += mass;
+    if (gridDepth[cell] > FLUID_DEPTH_MAX) gridDepth[cell] = FLUID_DEPTH_MAX;
 
-#if FLUID_TOUCH_ENABLE
-    const bool finger = touchOn;
+    /* landing makes a ripple: a small kick on the edge it came through */
+    gridFluxY[cell] = clampf(gridFluxY[cell] - mass * 0.5f,
+                             -FLUID_MAX_FLUX * (float)cellPx,
+                              FLUID_MAX_FLUX * (float)cellPx);
+}
+
+static void fluidDropSpawn(float gx, float gy, float shake)
+{
+#if FLUID_DROPS
+    static float pending = 0.0f;
+
+    pending += FLUID_DROP_RATE * shake * shake;
+
+    while (pending >= 1.0f && dropCount < FLUID_DROP_MAX)
+    {
+        pending -= 1.0f;
+
+        /* look for a shallow cell to take the droplet from: a few random tries
+         * is plenty, and it keeps the drops spread over the whole surface */
+        int best = 0;
+        for (int t = 0; t < 8; t++)
+        {
+            const int x = random(0, gridCols);
+            const int y = random(0, gridRows);
+            const int c = gidx(x, y);
+            if (gridInside[c] && gridDepth[c] >= FLUID_DROP_MIN) { best = c; break; }
+        }
+        if (!best) break;
+
+        /* where on the screen is that cell? (undo gidx) */
+        int x, y;
+        {
+            const int off = best - GRID_STRIDE - 1;
+            x = off % GRID_STRIDE;
+            y = off / GRID_STRIDE;
+        }
+
+        FluidDrop &d = drops[dropCount++];
+        const float take = (gridDepth[best] < FLUID_DROP_MASS) ? gridDepth[best]
+                                                              : FLUID_DROP_MASS;
+
+        d.x    = ((float)x + 0.5f) * (float)cellPx;
+        d.y    = ((float)y + 0.5f) * (float)cellPx;
+        d.vx   = -gx * FLUID_DROP_LAUNCH * 0.6f + frand() * FLUID_DROP_SPREAD * 0.5f;
+        d.vy   = -gy * FLUID_DROP_LAUNCH
+                 + frand() * FLUID_DROP_SPREAD * 0.5f
+                 - 0.35f * FLUID_DROP_LAUNCH;
+        d.mass = take;
+        d.life = FLUID_DROP_LIFE;
+
+        gridDepth[best] -= take;                /* the pool pays for it */
+    }
 #else
-    const bool finger = false;
+    (void)gx; (void)gy; (void)shake;
 #endif
-
-    (void)finger;
-    memset(gridDelta, 0, sizeof(gridDelta));
-
-    for (int y = 0; y < gridRows; y++)
-    {
-        for (int x = 0; x < gridCols; x++)
-        {
-            const int i = gidx(x, y);
-            if (!gridInside[i]) continue;
-
-            const float m = gridMass[i];
-            if (m < 0.002f) continue;
-
-            float wl[4] = { w[0], w[1], w[2], w[3] };
-            float kk    = kBase;
-
-#if FLUID_TOUCH_ENABLE
-            if (finger)
-            {
-                /* Your finger is a gravity well pointing away from itself: the
-                 * closer a cell is to the finger, the harder it is pushed. */
-                const float fx = (float)(x * cellPx + cellPx / 2) - (float)touchX;
-                const float fy = (float)(y * cellPx + cellPx / 2) - (float)touchY;
-                const float d2 = fx * fx + fy * fy;
-
-                if (d2 < (float)(FLUID_TOUCH_R * FLUID_TOUCH_R))
-                {
-                    const float d   = sqrtf(d2) + 1.0f;
-                    const float amp = gb * FLUID_TOUCH_PUSH *
-                                      (1.0f - d / (float)(FLUID_TOUCH_R + 1));
-                    if (fx > 0.0f) wl[0] += amp * ( fx / d);
-                    else           wl[1] += amp * (-fx / d);
-                    if (fy > 0.0f) wl[2] += amp * ( fy / d);
-                    else           wl[3] += amp * (-fy / d);
-
-                    const float sum = wl[0] + wl[1] + wl[2] + wl[3];
-                    if (sum > 1e-6f) kk = FLUID_FLOW_RATE / sum;
-                }
-            }
-#endif
-
-            /* Hand out what is above the neighbours, never more than we hold. */
-            float avail = m;
-            for (int o = 0; o < 4; o++)
-            {
-                const int dir = ord[o];
-                const int n   = i + kDirDX[dir] + kDirDY[dir] * GRID_STRIDE;
-                if (!gridInside[n]) continue;
-
-                const float head = m - gridMass[n];
-                if (head <= 0.0f) continue;
-
-                float f = head * wl[dir] * kk;
-                if (f > FLUID_MAX_FLOW) f = FLUID_MAX_FLOW;
-                if (f > avail)          f = avail;
-                if (f <= 0.0f)          break;
-
-                avail -= f;
-                gridDelta[i] -= f;
-                gridDelta[n] += f;
-            }
-        }
-    }
-
-    fluidApplyDelta();
 }
 
-/* A light diffusion of the mass field: it rounds off the staircase the grid puts
- * into the surface, and it makes the liquid a little thicker.  Each pair of cells
- * exchanges in one direction only, so the total stays exact. */
-static void fluidRelax(void)
+static void fluidDrops(float dt, float gx, float gy)
 {
-    if (FLUID_VISCOSITY <= 0.0f) return;
+#if FLUID_DROPS
+    const float lim = (float)FLUID_TANK_RADIUS;
 
-    memset(gridDelta, 0, sizeof(gridDelta));
-
-    for (int y = 0; y < gridRows; y++)
+    for (int i = 0; i < dropCount; )
     {
-        for (int x = 0; x < gridCols; x++)
+        FluidDrop &d = drops[i];
+
+        d.life -= dt;
+        d.vx += gx * FLUID_DROP_G * dt;
+        d.vy += gy * FLUID_DROP_G * dt;
+        d.x  += d.vx * dt;
+        d.y  += d.vy * dt;
+
+        /* -- the glass: bounce off the round wall and off the edges --- */
+        const float rx = d.x - (float)CX, ry = d.y - (float)CY;
+        const float r2 = rx * rx + ry * ry;
+        bool outside = (d.x < 1.0f || d.x > (float)(W - 2) ||
+                        d.y < 1.0f || d.y > (float)(H - 2));
+
+        if (FLUID_TANK_ROUND && r2 > lim * lim) outside = true;
+
+        if (outside)
         {
-            const int i = gidx(x, y);
-            if (!gridInside[i]) continue;
-
-            const float m = gridMass[i];
-
-            for (int dir = 0; dir < 4; dir++)
+            if (FLUID_TANK_ROUND && r2 > lim * lim && r2 > 1e-3f)
             {
-                const int n = i + kDirDX[dir] + kDirDY[dir] * GRID_STRIDE;
-                if (!gridInside[n]) continue;
-
-                const float head = m - gridMass[n];
-                if (head <= 0.0f) continue;
-
-                const float f = head * FLUID_VISCOSITY;
-                gridDelta[i] -= f;
-                gridDelta[n] += f;
+                const float r  = sqrtf(r2);
+                const float nx = rx / r, ny = ry / r;
+                const float vn = d.vx * nx + d.vy * ny;
+                d.vx -= 1.6f * vn * nx;         /* reflect, lose a little */
+                d.vy -= 1.6f * vn * ny;
+                d.x   = (float)CX + nx * (lim - 1.0f);
+                d.y   = (float)CY + ny * (lim - 1.0f);
             }
+            if      (d.x < 1.0f)             { d.x = 1.0f;             d.vx = -d.vx * 0.6f; }
+            else if (d.x > (float)(W - 2))   { d.x = (float)(W - 2);   d.vx = -d.vx * 0.6f; }
+            if      (d.y < 1.0f)             { d.y = 1.0f;             d.vy = -d.vy * 0.6f; }
+            else if (d.y > (float)(H - 2))   { d.y = (float)(H - 2);   d.vy = -d.vy * 0.6f; }
         }
-    }
 
-    fluidApplyDelta();
+        /* -- is it back in the liquid? -------------------------------- */
+        int cx = (int)d.x / cellPx, cy = (int)d.y / cellPx;
+        if (cx < 0) cx = 0;  if (cy < 0) cy = 0;
+        if (cx >= gridCols) cx = gridCols - 1;
+        if (cy >= gridRows) cy = gridRows - 1;
+
+        const int  c    = gidx(cx, cy);
+        const bool land = gridInside[c] && gridDepth[c] >= 1.5f;
+        bool       gone = (d.life <= 0.0f) || land;
+
+        if (!gone) { i++; continue; }
+
+        /* give the mass back where it is, so nothing is ever lost */
+        if (gridInside[c])
+        {
+            fluidDropAdd(c, d.mass);
+        }
+        else if (cx == 0 && cy == 0)
+        {
+            /* it died outside the glass entirely: hand the mass to any cell of
+             * the tank, so the total never drifts */
+            for (int k = 0; k < GRID_CELLS; k++)
+                if (gridInside[k]) { fluidDropAdd(k, d.mass); break; }
+        }
+
+        drops[i] = drops[--dropCount];          /* swap-remove */
+    }
+#endif
+    dropLive = dropCount;
 }
 
-/* Liquid under the finger, while it is down: this is how you change the amount
- * without a recompile, and it is the same knob as FLUID_FILL_PCT. */
+/* Liquid under the finger, while it is down: how you change the amount without a
+ * recompile, and the same knob as FLUID_FILL_PCT.  This is the only place in the
+ * sketch that creates liquid - everything else is exact bookkeeping. */
 static void fluidPaint(float dt)
 {
 #if FLUID_TOUCH_ENABLE
@@ -925,17 +1175,19 @@ static void fluidPaint(float dt)
 
     static const int8_t pdx[5] = { 0, -1, +1,  0,  0 };
     static const int8_t pdy[5] = { 0,  0,  0, -1, +1 };
-    const int cx = touchX / cellPx, cy = touchY / cellPx;
+    const int cx  = touchX / cellPx, cy = touchY / cellPx;
     const int rad = FLUID_TOUCH_R / (2 * cellPx) + 1;
 
     for (int k = 0; k < 5; k++)
     {
         const int x = cx + pdx[k] * rad, y = cy + pdy[k] * rad;
         if (x < 0 || y < 0 || x >= gridCols || y >= gridRows) continue;
+
         const int i = gidx(x, y);
         if (!gridInside[i]) continue;
-        gridMass[i] += FLUID_TOUCH_PAINT * dt * 0.25f;
-        if (gridMass[i] > FLUID_CELL_MAX) gridMass[i] = FLUID_CELL_MAX;
+
+        gridDepth[i] += FLUID_TOUCH_PAINT * dt * 0.25f;
+        if (gridDepth[i] > FLUID_DEPTH_MAX) gridDepth[i] = FLUID_DEPTH_MAX;
     }
 #else
     (void)dt;
@@ -944,210 +1196,40 @@ static void fluidPaint(float dt)
 
 /* ================================================================== */
 /* 13. From the grid to the picture                                    */
-/*                                                                    */
-/*  The simulation is a grid, the picture is not - and this is where   */
-/*  the difference is made.  Per frame:                                */
-/*                                                                    */
-/*    1. for every line of the grid across the gravity axis, add up     */
-/*       the mass of the cells that are connected to the floor.  That   */
-/*       sum is the height of the liquid in that line.                  */
-/*    2. cut that height into FLUID_SHADE_BANDS bands and turn each one */
-/*       into one rectangle (a rectangle for the whole line, not one    */
-/*       per cell - which is why a 40 x 40 grid costs about 130 fills   */
-/*       per frame instead of 1600).                                    */
-/*    3. everything that holds liquid but is NOT connected to the floor */
-/*       - spray thrown up by a shake - becomes a small square per cell. */
-/*                                                                    */
-/*  The rectangle list is then drawn once per strip; each strip only    */
-/*  touches the rectangles that fall into it, so the list is built once */
-/*  and used fifteen times.                                            */
 /* ================================================================== */
-static void emitRectPx(int x0, int y0, int x1, int y1, uint32_t c, uint8_t add)
+/*  Every cell's depth becomes one byte of the field, and the field is  */
+/*  what the renderer samples: per pixel, bilinearly, straight into a   */
+/*  colour table entry.  The scale is picked so that the deepest cell of */
+/*  the frame uses the whole table, which is why even a shallow puddle   */
+/*  shows the full range of shades; that reference is smoothed over time */
+/*  so the picture does not flicker when a wave passes under one cell.    */
+/* ================================================================== */
+static void fluidField(void)
 {
-    if (x1 < x0 || y1 < y0) return;
-    if (rectCount >= FLUID_MAX_RECTS) { rectDropped++; return; }
+    float deepest = 0.0f;
+    for (int i = 0; i < GRID_CELLS; i++)
+        if (gridInside[i] && gridDepth[i] > deepest) deepest = gridDepth[i];
 
-    FluidRect &r = rects[rectCount++];
-    r.x0 = (int16_t)x0;  r.y0 = (int16_t)y0;
-    r.x1 = (int16_t)x1;  r.y1 = (int16_t)y1;
-    r.c  = c;
-    r.add = add;
-}
+    if (deepest > FLUID_DEPTH_FULL) deepest = FLUID_DEPTH_FULL;
 
-/* the pixel rectangle of one grid cell; "vertical" = the sweep runs down a
- * column of the grid, so the line index is x and the cell index is y */
-static inline void cellPxRange(bool vertical, int line, int idx,
-                               int &x0, int &y0, int &x1, int &y1)
-{
-    const int a0 = line * cellPx, a1 = a0 + cellPx - 1;
-    const int b0 = idx  * cellPx, b1 = b0 + cellPx - 1;
+    fieldRef += (deepest - fieldRef) * 0.05f;
+    if (fieldRef < 12.0f) fieldRef = 12.0f;
 
-    if (vertical) { x0 = a0; x1 = a1; y0 = b0; y1 = b1; }
-    else          { y0 = a0; y1 = a1; x0 = b0; x1 = b1; }
-}
+    const float k = 255.0f / fieldRef;
 
-/* one run of liquid, from the floor of a line towards its surface:
- * s0..s1 are along the sweep axis, perp0..perp1 across it */
-static inline void emitSweepRun(bool vertical, int perp0, int perp1,
-                                int s0, int s1, uint32_t c, uint8_t add)
-{
-    if (vertical) emitRectPx(perp0, s0, perp1, s1, c, add);
-    else          emitRectPx(s0, perp0, s1, perp1, c, add);
-}
+    memset(gridField, 0, sizeof(gridField));
 
-static void fluidPlan(void)
-{
-    rectCount   = 0;
-    rectDropped = 0;
-
-    /* Which way do we sweep?  Along gravity: a display standing on its side
-     * pools against the left or right wall, and then the lines of the grid run
-     * horizontally, so the same code renders both cases. */
-    const bool  vertical = fabsf(fluidDirY) >= fabsf(fluidDirX);
-    const int   lines    = vertical ? gridCols : gridRows;
-    const float cellF    = (float)cellPx;
-    const int   idxMax   = (vertical ? gridRows : gridCols) - 1;
-
-    /* ---- pass 1: how deep the liquid is in every line ---------------- */
-    lineHeightMax = 0.01f;
-
-    for (int p = 0; p < lines; p++)
+    for (int y = 0; y < gridRows; y++)
+    for (int x = 0; x < gridCols; x++)
     {
-        const bool down  = vertical ? (fluidDirY >= 0.0f) : (fluidDirX >= 0.0f);
-        const int  first = vertical ? (down ? lineBot[p] : lineTop[p])
-                                    : (down ? lineRight[p] : lineLeft[p]);
-        const int  last  = vertical ? (down ? lineTop[p] : lineBot[p])
-                                    : (down ? lineLeft[p] : lineRight[p]);
-        float h = 0.0f;
+        const int i = gidx(x, y);
+        if (!gridInside[i]) continue;
 
-        if (first >= 0 && last >= 0)
-        {
-            const int step = (first <= last) ? +1 : -1;
-            for (int idx = first; ; idx += step)
-            {
-                const float m = gridMass[vertical ? gidx(p, idx) : gidx(idx, p)];
-                if (m < FLUID_CONNECT_MIN) break;      /* the pool stops here */
-                h += m;
-                if (idx == last) break;
-            }
-        }
-
-        lineHeight[p] = h;
-        if (h > lineHeightMax) lineHeightMax = h;
-    }
-
-    /* ---- pass 2: one line at a time --------------------------------- */
-    for (int p = 0; p < lines; p++)
-    {
-        const float h = lineHeight[p];
-        if (h * cellF < 1.0f) continue;                /* thinner than a pixel */
-
-        const bool down  = vertical ? (fluidDirY >= 0.0f) : (fluidDirX >= 0.0f);
-        const int  first = vertical ? (down ? lineBot[p] : lineTop[p])
-                                    : (down ? lineRight[p] : lineLeft[p]);
-        const int  last  = vertical ? (down ? lineTop[p] : lineBot[p])
-                                    : (down ? lineLeft[p] : lineRight[p]);
-        if (first < 0 || last < 0) continue;
-
-        const int step = (first <= last) ? +1 : -1;
-
-        /* the floor edge in pixels along the sweep axis, the tank's span on that
-         * axis, and the line's pixel range across it */
-        int floorPx, spanLo, spanHi, perp0, perp1;
-        if (vertical)
-        {
-            perp0 = p * cellPx;
-            perp1 = (perp0 + cellPx - 1 < W - 1) ? perp0 + cellPx - 1 : W - 1;
-            spanLo = colY0[p];
-            spanHi = colY1[p];
-        }
-        else
-        {
-            perp0 = p * cellPx;
-            perp1 = (perp0 + cellPx - 1 < H - 1) ? perp0 + cellPx - 1 : H - 1;
-            spanLo = rowX0[p];
-            spanHi = rowX1[p];
-        }
-        if (spanHi < spanLo) continue;
-
-        floorPx = (step < 0) ? (first + 1) * cellPx : first * cellPx;
-
-        /* the surface, clamped to the wall of the tank */
-        float surf = (float)floorPx + (float)step * h * cellF;
-        if (step < 0) { if (surf < (float)spanLo) surf = (float)spanLo; }
-        else          { if (surf > (float)spanHi) surf = (float)spanHi; }
-
-        const int   runLo  = iround((surf < (float)floorPx) ? surf : (float)floorPx);
-        const int   runHi  = iround((surf > (float)floorPx) ? surf : (float)floorPx);
-        const float runLen = (float)(runHi - runLo + 1);
-        if (runLen < 1.0f) continue;
-
-        float rel = h / lineHeightMax;
-        if (rel > 1.0f) rel = 1.0f;
-
-        /* ---- the body of the liquid, in bands from the floor up ------ */
-        for (int b = 0; b < FLUID_SHADE_BANDS; b++)
-        {
-            const float f0 = (float)b / (float)FLUID_SHADE_BANDS;
-            const float f1 = (float)(b + 1) / (float)FLUID_SHADE_BANDS;
-
-            int e0, e1;
-            if (step < 0)                      /* floor = the bottom edge  */
-            {
-                e0 = iround((float)floorPx - runLen * f1);
-                e1 = iround((float)floorPx - runLen * f0);
-            }
-            else                               /* floor = the top edge     */
-            {
-                e0 = iround((float)floorPx + runLen * f0);
-                e1 = iround((float)floorPx + runLen * f1);
-            }
-            if (e1 < e0) { const int t = e0; e0 = e1; e1 = t; }
-
-            emitSweepRun(vertical, perp0, perp1, e0, e1 - 1,
-                         fluidColour((f0 + f1) * 0.5f, rel, false), 0);
-        }
-
-        /* ---- the bright line where the liquid meets the air --------- */
-        if (FLUID_SURFACE_GAIN > 0)
-        {
-            int t0, t1;
-            if (step < 0) { t0 = runLo; t1 = t0 + FLUID_SURFACE_PX - 1; }
-            else          { t1 = runHi; t0 = t1 - FLUID_SURFACE_PX + 1; }
-            emitSweepRun(vertical, perp0, perp1, t0, t1,
-                         fluidColour(1.0f, rel, true), 1);
-        }
-
-        /* ---- spray: mass that is no longer part of the pool ---------- */
-        int  idx = first;
-        bool gap = false;
-
-        for (;; idx += step)
-        {
-            const float m = gridMass[vertical ? gidx(p, idx) : gidx(idx, p)];
-            if (m < FLUID_CONNECT_MIN) { gap = true; break; }
-            if (idx == last) { idx += step; break; }
-        }
-        if (gap) idx += step;                    /* skip the surface cell */
-
-        for (; idx >= 0 && idx <= idxMax; idx += step)
-        {
-            const float m = gridMass[vertical ? gidx(p, idx) : gidx(idx, p)];
-            if (m < FLUID_SPRAY_MIN) continue;
-
-            int x0, y0, x1, y1;
-            cellPxRange(vertical, p, idx, x0, y0, x1, y1);
-
-            int w = iround(cellF * (m < 1.0f ? m : 1.0f));
-            if (w < 2)      w = 2;
-            if (w > cellPx) w = cellPx;
-
-            const int cx2 = (x0 + x1) / 2, cy2 = (y0 + y1) / 2;
-            emitRectPx(cx2 - w / 2, cy2 - w / 2, cx2 + w / 2, cy2 + w / 2,
-                       fluidColour(1.0f, rel, true), 0);
-        }
+        const int v = (int)(gridDepth[i] * k + 0.5f);
+        gridField[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
     }
 }
+
 /* ================================================================== */
 /* 14. Input: the touch panel                                          */
 /*                                                                    */
@@ -1210,7 +1292,7 @@ static void fluidDrawStrip(AMOLED_Canvas &cv)
     cv.fillScreen(FLUID_BG);
 
 #if FLUID_SHOW_GRID
-    /* the cells the simulation really uses - the quickest way to see what
+    /* the cells the solver really uses - the quickest way to see what
      * FLUID_GRID_COLS does */
     for (int x = cellPx; x < W; x += cellPx)
         cv.fillRect(x - 1, 0, x - 1, H - 1, 0x1A1A1A);
@@ -1218,15 +1300,67 @@ static void fluidDrawStrip(AMOLED_Canvas &cv)
         cv.fillRect(0, y - 1, W - 1, y - 1, 0x1A1A1A);
 #endif
 
-    /* the liquid: one rectangle per band of every line of the grid */
-    for (int i = 0; i < rectCount; i++)
-    {
-        const FluidRect &r = rects[i];
-        if (r.y1 < cv.windowY0() || r.y0 > cv.windowY1()) continue;   /* other strip */
+    /* ---- the liquid: one bilinear sample of the field per pixel ----
+     * No rectangles and no cell edges: the depth is read between four cells and
+     * blended, so the surface is smooth to the pixel and moves by fractions of a
+     * cell.  The colour is a table lookup - entry 0 is the background, so an
+     * empty pixel is not even written. */
+    int x0 = cv.windowX0(), x1 = cv.windowX1();
+    int y0 = cv.windowY0(), y1 = cv.windowY1();
+    if (x0 < 0)     x0 = 0;
+    if (y0 < 0)     y0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (y1 > H - 1) y1 = H - 1;
 
-        if (r.add) cv.addRect(r.x0, r.y0, r.x1, r.y1, r.c);
-        else       cv.fillRect(r.x0, r.y0, r.x1, r.y1, r.c);
+    for (int y = y0; y <= y1; y++)
+    {
+        /* the two cell rows this pixel sits between, already offset into the
+         * padded array */
+        const uint8_t *rowA = gridField + (pxCellY[y] + 1) * GRID_STRIDE + 1;
+        const uint8_t *rowB = rowA + GRID_STRIDE;
+        const int      fy   = pxFracY[y];
+        const int      iy   = 256 - fy;
+
+        uint8_t *p = cv.ptr(x0, y);
+
+        for (int x = x0; x <= x1; x++)
+        {
+            const int cx = pxCellX[x];
+            const int fx = pxFracX[x];
+            const int ix = 256 - fx;
+
+            /* bilinear: along the row first, then between the rows.  Both are
+             * fixed point with 8 fractional bits, hence the two shifts. */
+            const int a = rowA[cx] * ix + rowA[cx + 1] * fx;   /* 0 .. 65280 */
+            const int b = rowB[cx] * ix + rowB[cx + 1] * fx;
+            const int k = ((a * iy + b * fy) >> 16) >> FLUID_LUT_SHIFT;
+
+            if (k) amoledPxSet(p, lutR[k], lutG[k], lutB[k]);
+
+            p += cv.strideX();
+        }
     }
+
+    /* ---- the droplets a shake threw into the air ------------------ */
+#if FLUID_DROPS
+    {
+        int rim = (int)(FLUID_RIM * (float)(FLUID_LUT_N - 1));
+        if (rim < 1) rim = 1;
+        if (rim > FLUID_LUT_N - 1) rim = FLUID_LUT_N - 1;
+
+        const uint32_t dropCol = amoledRGB(lutR[rim], lutG[rim], lutB[rim]);
+
+        for (int i = 0; i < dropCount; i++)
+        {
+            const FluidDrop &d = drops[i];
+            if (d.y < (float)y0 - 3.0f || d.y > (float)y1 + 3.0f) continue;
+            if (d.x < (float)x0 - 3.0f || d.x > (float)x1 + 3.0f) continue;
+
+            cv.fillCircle(iround(d.x), iround(d.y),
+                          (d.mass > FLUID_DROP_MASS * 0.5f) ? 3 : 2, dropCol);
+        }
+    }
+#endif
 
 #if FLUID_SHOW_RING
     cv.addCircle(CX, CY, FLUID_TANK_RADIUS, 0x203040, 200);   /* the tank wall */
@@ -1246,6 +1380,7 @@ static void fluidDrawStrip(AMOLED_Canvas &cv)
     hudTextCentered(cv, 58, imuLine, AMOLED_GREY);
 #endif
 }
+
 /* ================================================================== */
 /* 16. The readout strings                                             */
 /* ================================================================== */
@@ -1259,7 +1394,7 @@ static void fluidBuildProfileLine(void)
 {
     if (!FLUID_SHOW_PROFILE) { profileLine[0] = 0; return; }
     snprintf(profileLine, sizeof(profileLine),
-             "PHY %.1f PLN %.1f DRW %.1f DMA %.1f", msPhys, msPlan, msDraw, msDma);
+             "PHY %.1f FLD %.1f DRW %.1f DMA %.1f", msPhys, msField, msDraw, msDma);
 }
 
 static void fluidBuildImuLine(void)
@@ -1268,16 +1403,16 @@ static void fluidBuildImuLine(void)
 
     if (!imuOk || !gravityOk)
     {
-        snprintf(imuLine, sizeof(imuLine), "NO IMU - synthetic gravity");
+        snprintf(imuLine, sizeof(imuLine), "NO IMU - SYNTHETIC GRAVITY");
         return;
     }
 
     const int8_t *s = kImuSigns[imuSignIdx];
     snprintf(imuLine, sizeof(imuLine),
-             "G %+.2f %+.2f %+.2f SIGN %d %c %c %c SHAKE %d%%",
+             "G %+.2f %+.2f %+.2f  SIGN %d %c%c%c  SLOSH %.1f  SHAKE %d%%",
              gravityDisp.x, gravityDisp.y, gravityDisp.z, imuSignIdx,
              s[0] > 0 ? '+' : '-', s[1] > 0 ? '+' : '-', s[2] > 0 ? '+' : '-',
-             iround(shakeLevel * 100.0f));
+             fluidSpeed, iround(shakeLevel * 100.0f));
 }
 
 /* ================================================================== */
@@ -1335,13 +1470,19 @@ void setup()
                       (unsigned long)(AMOLED_QSPI_CLOCK_HZ / 1000000UL));
         Serial.printf("grid %d x %d, cell %d px, %d cells in the tank, %.0f%% full\n",
                       gridCols, gridRows, cellPx, fluidTankCells(), fluidFillPct);
+        Serial.printf("solver: flow %.2f damp %.3f flux %.2f tension %.3f, %d step(s) per frame\n",
+                      (double)FLUID_FLOW, (double)FLUID_DAMP, (double)FLUID_MAX_FLUX,
+                      (double)FLUID_TENSION, (int)FLUID_MAX_STEPS);
+        Serial.printf("renderer: bilinear field %d x %d, %d entry colour table\n",
+                      gridCols, gridRows, (int)FLUID_LUT_N);
         Serial.printf("IMU %s\n", imuOk ? "found" : "NOT found - synthetic gravity");
         Serial.printf("one frame is %d kB over the bus; commands: + - r p s\n",
                       (int)((long)W * H * 3 / 1024));
     }
 
     /* a first frame, so the panel never shows whatever came out of reset */
-    fluidPlan();
+    fluidField();
+    fluidBuildLut();
     fluidBuildFpsLine();
     fluidBuildProfileLine();
     fluidBuildImuLine();
@@ -1376,33 +1517,52 @@ void loop()
     /* ---- input ---------------------------------------------------- */
     imuUpdate();                       /* one sample, if the sensor has one */
     touchUpdate();
-    fluidGravityUpdate(dt);            /* -> fluidDirX / fluidDirY / fluidMag */
+    fluidGravityUpdate(dt);            /* -> fluidDirX / fluidDirY / fluidMag
+                                        *    and shakeLevel                   */
 
     /* ---- simulate -------------------------------------------------
-     * One substep is FLUID_PHYS_MS of simulated time and the number of substeps
-     * follows the real frame time, so the liquid moves at the same speed whether
-     * the sketch runs at 20 or at 60 fps. */
+     * One step is FLUID_PHYS_MS of simulated time and the number of steps follows
+     * the real frame time, so the liquid moves at the same speed whether the
+     * sketch runs at 20 or at 60 fps. */
     int steps = iround(dt * 1000.0f / FLUID_PHYS_MS);
-    if (steps < 1)                    steps = 1;
-    if (steps > FLUID_MAX_SUBSTEPS)   steps = FLUID_MAX_SUBSTEPS;
+    if (steps < 1)                  steps = 1;
+    if (steps > FLUID_MAX_STEPS)    steps = FLUID_MAX_STEPS;
+
+    /* the gravity the solver sees, in pixels of head per cell: the fall
+     * direction times how hard it is pulling (1.0 = the board upright) */
+    const float gx = fluidDirX * fluidMag;
+    const float gy = fluidDirY * fluidMag;
+
+    /* a shake is a violent, changing acceleration: it kicks the flows about, and
+     * past FLUID_SPLASH_MIN it also starts throwing droplets around */
+    float kick = 0.0f;
+    if (FLUID_SHAKE_KICK > 0.0f && shakeLevel > FLUID_SPLASH_MIN)
+    {
+        kick = FLUID_SHAKE_KICK * (shakeLevel - FLUID_SPLASH_MIN) /
+               (1.0f - FLUID_SPLASH_MIN) * FLUID_MAX_FLUX * (float)cellPx;
+    }
 
     for (int s = 0; s < steps; s++)
     {
-        fluidStep(fluidDirX, fluidDirY, fluidMag);
-        fluidRelax();
+        fluidStep(gx, gy, kick);
+        fluidTension();
     }
-    fluidPaint(dt);
+
+    fluidPaint(dt);                    /* the finger adds liquid, if enabled */
+    fluidDropSpawn(fluidDirX, fluidDirY, shakeLevel);
+    fluidDrops(dt, gx, gy);
 
     const uint32_t afterPhys = micros();
 
     /* ---- the picture ---------------------------------------------- */
-    fluidPlan();                       /* grid -> rectangle list */
-
     hueBase += FLUID_HUE_SPEED * dt;
     if (hueBase >= 360.0f) hueBase -= 360.0f;
 
-    const uint32_t afterPlan = micros();
-    uint32_t       drawUs    = 0;
+    fluidField();                      /* grid -> the byte field the renderer reads */
+    fluidBuildLut();                   /* this frame's colours                     */
+
+    const uint32_t afterField = micros();
+    uint32_t       drawUs     = 0;
 
     AMOLED_Canvas &cv = amoled.canvas();
     amoled.beginFrame();
@@ -1419,10 +1579,10 @@ void loop()
 
     /* ---- where did the time go? ----------------------------------- */
     msPhys  = (float)(afterPhys - frameStart) * 0.001f;
-    msPlan  = (float)(afterPlan - afterPhys) * 0.001f;
+    msField = (float)(afterField - afterPhys) * 0.001f;
     msDraw  = (float)drawUs * 0.001f;
     msFrame = (float)(afterDraw - frameStart) * 0.001f;
-    msDma   = msFrame - msPhys - msPlan - msDraw;
+    msDma   = msFrame - msPhys - msField - msDraw;
     if (msDma < 0.0f) msDma = 0.0f;
 
     /* every frame is W * H * 3 bytes over the bus, so this is the bandwidth the
@@ -1430,7 +1590,7 @@ void loop()
     mbPerSec = (float)((double)W * (double)H * 3.0 * 0.001 /
                        (double)(msFrame > 0.01f ? msFrame : 0.01f));
 
-    fluidMass = fluidMassTotal();
+    fluidMass = fluidMeasure(&fluidWetPct);
 
     fluidBuildProfileLine();
 
@@ -1447,14 +1607,16 @@ void loop()
 #if FLUID_SERIAL_FPS
         if (Serial)
         {
-            const int tank = fluidTankCells();
-            Serial.printf("fps %5.1f | frame %6.2f ms | phys %4.1f plan %3.1f draw %4.1f dma %5.1f"
-                          " | %4.1f MB/s | grid %dx%d %d px | liquid %5.1f/%d %3.0f%%"
-                          " | rects %3d%s | g %+.2f %+.2f %+.2f | shake %3d%% | pal %d sign %d\n",
-                          fps, msFrame, msPhys, msPlan, msDraw, msDma, mbPerSec,
-                          gridCols, gridRows, cellPx,
-                          fluidMass, tank, 100.0f * fluidMass / (float)tank,
-                          rectCount, rectDropped ? " (list full)" : "",
+            const int   tank = fluidTankCells();
+            const float fill = fluidWetPct;
+
+            Serial.printf("fps %5.1f | frame %6.2f ms | phys %4.1f field %4.1f draw %4.1f dma %5.1f"
+                          " | %4.1f MB/s | grid %dx%d %d px | wet %3.0f%% of %d cells"
+                          " | liquid %6.0f px | flow %4.1f px"
+                          " | drops %2d | g %+.2f %+.2f %+.2f | shake %3d%% | pal %d sign %d\n",
+                          fps, msFrame, msPhys, msField, msDraw, msDma, mbPerSec,
+                          gridCols, gridRows, cellPx, fill, tank, fluidMass, fluidSpeed,
+                          dropLive,
                           gravityDisp.x, gravityDisp.y, gravityDisp.z,
                           iround(shakeLevel * 100.0f), paletteMode, imuSignIdx);
         }
@@ -1497,7 +1659,3 @@ void loop()
     }
 #endif
 }
-
-
-
-
